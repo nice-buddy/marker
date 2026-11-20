@@ -164,8 +164,8 @@ class ViewerEngine:
             "use_llm": False,
             "strip_existing_ocr": False,
             "keep_headers_footers": False,
-            "dpi": 150,
-            "max_pages": 20,
+            "dpi": 300,
+            "max_pages": 1000,
         }
         self.tmp = tempfile.TemporaryDirectory(prefix="marker_viewer_")
         self.docs_lock = threading.Lock()
@@ -304,7 +304,7 @@ class ViewerEngine:
         keep_headers_footers = bool(
             opts.get("keep_headers_footers", opts.get("furniture", False))
         )
-        dpi = int(max(72, min(300, float(opts.get("dpi") or 150))))
+        dpi = int(max(72, min(300, float(opts.get("dpi") or 300))))
 
         cli_options = {
             "page_range": str(n),
@@ -869,8 +869,8 @@ footer{padding:18px 24px;border-top:var(--hairline) solid var(--rule);display:fl
   <label class="sw">Strip existing OCR<input type="checkbox" id="strip_ocr"></label>
   <label class="sw">Keep headers and footers<input type="checkbox" id="furniture"></label>
   <div class="row2">
-   <div class="field"><span class="label">DPI</span><select id="dpi"><option selected>150</option><option>200</option><option>300</option></select></div>
-   <div class="field"><span class="label">Max pages</span><input id="maxp" type="number" min="1" value="20"></div>
+   <div class="field"><span class="label">DPI</span><select id="dpi"><option>150</option><option>200</option><option selected>300</option></select></div>
+   <div class="field"><span class="label">Max pages</span><input id="maxp" type="number" min="1" value="1000"></div>
   </div>
   <div class="field"><span class="label">Page range (0-indexed)</span><input id="prange" type="text" placeholder="All (or e.g. 0,2-5)"></div>
   <button class="btn" id="rerun" disabled>Convert again with these options</button>
@@ -1050,7 +1050,7 @@ function opts(){
 
 async function run(){
  stopTimer();abortRun();
- const id=++runId,ctrl=new AbortController(),o=opts(),maxP=Math.max(1,+$('#maxp').value||20);
+ const id=++runId,ctrl=new AbortController(),o=opts(),maxP=Math.max(1,+$('#maxp').value||1000);
  runAbort=ctrl;
  const pageList=parsePageIndices($('#prange').value,doc.pages,maxP);
  if(!pageList.length){setBanner('err','No valid pages in range (0..'+(doc.pages-1)+')','',100,false);return;}
@@ -1210,10 +1210,10 @@ def viewer_cli(port: int | None = None, host: str | None = None):
         "--host", type=str, default="127.0.0.1", help="Host to bind the viewer to"
     )
     ap.add_argument(
-        "--dpi", type=int, default=150, help="Initial render resolution (DPI)"
+        "--dpi", type=int, default=300, help="Initial render resolution (DPI)"
     )
     ap.add_argument(
-        "--max-pages", type=int, default=20, help="Initial page limit per document"
+        "--max-pages", type=int, default=1000, help="Initial page limit per document"
     )
     ap.add_argument(
         "--mode",

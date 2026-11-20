@@ -5,6 +5,13 @@ import zipfile
 from marker.scripts.viewer import ViewerEngine
 
 
+def test_viewer_defaults(tmp_path):
+    engine = ViewerEngine(output_root=str(tmp_path))
+
+    assert engine.defaults["dpi"] == 300
+    assert engine.defaults["max_pages"] == 1000
+
+
 def _add_document(engine: ViewerEngine, doc_id: str, stem: str):
     out_folder = os.path.join(engine.output_root, stem)
     engine.docs[doc_id] = {
