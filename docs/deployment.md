@@ -895,6 +895,29 @@ marker_single input.pdf --output_dir /path/to/marker-md/outputs
 3. 服务端 `outputs/<文件名>/images/` 是否有文件。
 4. 日志是否有 layout 失败。
 
+### 12.11 Windows 均衡模式报 `'gbk' codec can't decode`
+
+Windows 默认使用 GBK 读取未显式指定编码的文本文件。Indra 的 `math_meta.json` 是 UTF-8，
+在 `balanced` 模式下可能触发：
+
+```text
+'gbk' codec can't decode byte 0x93 in position 7779: illegal multibyte sequence
+```
+
+当前代码已在 `marker/utils/surya_compat.py` 中为 Windows 增加 UTF-8 默认读取补丁，会在
+Marker 加载时自动应用。更新到最新提交并重启即可，不需要重装依赖：
+
+```powershell
+cd C:\App\AI\marker
+git pull
+```
+
+确认补丁存在：
+
+```powershell
+Select-String -Path .\marker\utils\surya_compat.py -Pattern "apply_windows_utf8_compat"
+```
+
 ## 13. 升级与回滚
 
 使用源码和 editable 安装时：

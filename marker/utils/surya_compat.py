@@ -1,11 +1,42 @@
-"""Compatibility patches for Surya's llama.cpp server lifecycle on Windows."""
+"""Windows compatibility patches for Surya/Indra runtime behavior."""
 
 import os
+from pathlib import Path
 from typing import Any, Callable
 
 from marker.logger import get_logger
 
 logger = get_logger()
+
+_ORIGINAL_READ_TEXT = Path.read_text
+
+
+def _utf8_read_text(
+    path: Path, encoding: str | None = None, errors: str | None = None, *args, **kwargs
+):
+    return _ORIGINAL_READ_TEXT(
+        path,
+        encoding=encoding or "utf-8",
+        errors=errors,
+        *args,
+        **kwargs,
+    )
+
+
+def apply_windows_utf8_compat() -> bool:
+    """Default ``Path.read_text`` to UTF-8 on Windows.
+
+    Indra reads model metadata with ``Path.read_text()`` and no encoding. On
+    Windows that defaults to GBK, which cannot decode the UTF-8 model JSON.
+    """
+    if os.name != "nt":
+        return False
+    if getattr(Path, "_marker_utf8_default", False):
+        return True
+    Path.read_text = _utf8_read_text
+    Path._marker_utf8_default = True
+    logger.info("Applied Windows UTF-8 default for Path.read_text.")
+    return True
 
 
 def _process_is_alive(pid: int) -> bool:
