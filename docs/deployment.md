@@ -137,12 +137,7 @@ cd ~/App/marker-md
 uv venv --python 3.12 .venv
 source .venv/bin/activate
 
-uv pip install -e ".[full]" \
-  "httpx[socks]" \
-  "httpcore[socks]" \
-  uvicorn \
-  fastapi \
-  python-multipart
+uv pip install -e ".[full]" "httpx[socks]" "httpcore[socks]" uvicorn fastapi python-multipart
 ```
 
 ### 6.3 配置 llama.cpp
