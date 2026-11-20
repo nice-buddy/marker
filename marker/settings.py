@@ -3,6 +3,8 @@ import os
 import platform
 import shutil
 import subprocess
+import sys
+from pathlib import Path
 
 from dotenv import find_dotenv
 from pydantic import computed_field, model_validator
@@ -28,10 +30,18 @@ def _is_apple_silicon() -> bool:
     return platform.system() == "Darwin" and platform.machine() == "arm64"
 
 
+def _default_output_dir() -> str:
+    """Default to ``outputs`` beside the active virtualenv (the app directory)."""
+    prefix = Path(sys.prefix)
+    if (prefix / "pyvenv.cfg").is_file():
+        return str(prefix.parent / "outputs")
+    return str(Path.cwd() / "outputs")
+
+
 class Settings(BaseSettings):
     # Paths
     BASE_DIR: str = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    OUTPUT_DIR: str = os.path.join(BASE_DIR, "conversion_results")
+    OUTPUT_DIR: str = _default_output_dir()
     # The rendering font is a runtime download; keep it out of the package tree, which may
     # be read-only (site-packages) or a git checkout (editable install).
     FONT_DIR: str = os.path.join(

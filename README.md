@@ -95,6 +95,8 @@ Our code is licensed under **Apache 2.0** — free to use, including commerciall
 
 You'll need python 3.10+ and [PyTorch](https://pytorch.org/get-started/locally/).
 
+For platform-specific deployment instructions, including Windows, macOS, Ubuntu, inference backends, and system services, see [docs/deployment.md](docs/deployment.md).
+
 Install with:
 
 ```shell
@@ -142,6 +144,9 @@ marker_gui --port 8000
 
 Then open `http://localhost:8000` in your browser (pass `--streamlit` if you want the legacy Streamlit UI).
 
+Converted pages are saved under `outputs/<document-name>/` beside the virtualenv, and the
+Markdown download is a `.zip` containing `<document-name>.md` plus the `images/` folder.
+
 ## Convert a single file
 
 ```shell
@@ -156,7 +161,7 @@ Options:
 - `--disable_ocr`: Never call the VLM - pure text-layer extraction (equations and scanned pages are skipped).
 - `--page_range TEXT`: Specify which pages to process. Accepts comma-separated page numbers and ranges. Example: `--page_range "0,5-10,20"` will process pages 0, 5 through 10, and page 20.
 - `--output_format [markdown|json|html|chunks]`: Specify the format for the output results.
-- `--output_dir PATH`: Directory where output files will be saved. Defaults to the value specified in settings.OUTPUT_DIR.
+- `--output_dir PATH`: Directory where output files will be saved. Defaults to `outputs` beside the active virtualenv (the application directory). Each document is written to `<output_dir>/<document-name>/` with its Markdown file and an `images/` folder.
 - `--paginate_output`: Paginates the output, using `\n\n{PAGE_NUMBER}` followed by `-` * 48, then `\n\n`
 - `--use_llm`: Uses an LLM to improve accuracy.  You will need to configure the LLM backend - see [below](#llm-services).
 - `--force_ocr`: Force OCR processing on the entire document, even for pages that might contain extractable text.
@@ -314,7 +319,7 @@ marker_single FILENAME --converter_cls marker.converters.ocr.OCRConverter
 
 Markdown output will include:
 
-- image links (images will be saved in the same folder)
+- relative image links (`images/...`) with images saved in the `images/` folder
 - formatted tables
 - embedded LaTeX equations (fenced with `$$`)
 - Code is fenced with triple backticks

@@ -112,9 +112,16 @@ class LayoutBuilder(BaseBuilder):
         if self.force_layout_block is not None:
             # Assign the full content of every page to a single layout type
             layout_results = self.forced_layout(document.pages)
-        elif self.force_ocr and self.ocr_full_page and not self.disable_ocr:
+        elif (
+            self.force_ocr
+            and self.ocr_full_page
+            and not self.disable_ocr
+            and not (self.extract_images and not self.disable_image_extraction)
+        ):
             # When force_ocr + ocr_full_page is enabled, every page is rebuilt
-            # by full-page OCR, so don't pay for a layout pass that gets thrown away.
+            # by full-page OCR, so don't pay for a layout pass that gets thrown
+            # away. Keep the layout pass when images are requested so picture
+            # blocks survive the full-page rebuild.
             layout_results = [
                 LayoutResult(bboxes=[], image_bbox=page.polygon.bbox)
                 for page in document.pages
@@ -260,9 +267,16 @@ class LayoutBuilder(BaseBuilder):
             provider_page_size = page.polygon.size
 
             if layout_result.error:
-                logger.warning(
-                    f"Layout inference failed for page {page.page_id}; leaving page empty."
-                )
+                if self.force_ocr and self.ocr_full_page and not self.disable_ocr:
+                    logger.warning(
+                        f"Layout inference failed for page {page.page_id}; "
+                        "full-page OCR will rebuild it."
+                    )
+                else:
+                    logger.warning(
+                        f"Layout inference failed for page {page.page_id}; "
+                        "leaving page empty."
+                    )
 
             for bbox in sorted(layout_result.bboxes, key=lambda x: x.position):
                 if bbox.label == BLANK_PAGE_LABEL:

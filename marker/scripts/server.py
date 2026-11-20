@@ -12,12 +12,13 @@ from pydantic import BaseModel, Field
 try:
     from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
     from fastapi.concurrency import run_in_threadpool
-    from starlette.responses import HTMLResponse, JSONResponse
+    from starlette.responses import HTMLResponse, JSONResponse, Response
 
     _HAS_FASTAPI = True
 except ImportError:
     _HAS_FASTAPI = False
     FastAPI = None  # type: ignore[assignment]
+    Response = Any  # type: ignore[assignment,misc]
     Request = Any  # type: ignore[assignment,misc]
     UploadFile = Any  # type: ignore[assignment,misc]
 
@@ -119,6 +120,11 @@ class ViewerPageParams(BaseModel):
     opts: Dict[str, Any] = Field(default_factory=dict)
 
 
+class ViewerPrepareParams(BaseModel):
+    id: str
+    pages: list[int] = Field(default_factory=list)
+
+
 if _HAS_FASTAPI:
     app = FastAPI(
         title="Marker API & Interactive Viewer",
@@ -166,6 +172,33 @@ if _HAS_FASTAPI:
             return JSONResponse(
                 status_code=400, content={"error": f"Conversion failed: {exc}"}
             )
+
+    @app.post("/prepare")
+    async def viewer_prepare(params: ViewerPrepareParams):
+        try:
+            return await run_in_threadpool(
+                viewer_engine.prepare, params.id, params.pages
+            )
+        except ValueError as exc:
+            return JSONResponse(status_code=400, content={"error": str(exc)})
+
+    @app.get("/download")
+    async def viewer_download(id: str):
+        try:
+            data, filename = await run_in_threadpool(
+                viewer_engine.download_zip, id
+            )
+        except ValueError as exc:
+            return JSONResponse(status_code=400, content={"error": str(exc)})
+        headers = {
+            "Content-Disposition": (
+                "attachment; filename*=UTF-8''"
+                + urllib.parse.quote(filename)
+            )
+        }
+        return Response(
+            content=data, media_type="application/zip", headers=headers
+        )
 else:
     app = None
 

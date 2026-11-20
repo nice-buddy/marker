@@ -12,10 +12,13 @@ import io
 import json
 import os
 import re
+import shutil
 import tempfile
 import threading
 import time
+import urllib.parse
 import uuid
+import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Dict, List, Optional
 
@@ -30,6 +33,7 @@ from marker.config.parser import ConfigParser
 from marker.converters.pdf import PdfConverter
 from marker.logger import get_logger
 from marker.models import create_model_dict
+from marker.output import make_image_paths_relative
 from marker.providers.registry import provider_from_filepath
 from marker.renderers.chunk import ChunkRenderer, json_to_chunks
 from marker.renderers.json import JSONRenderer
@@ -148,10 +152,12 @@ class ViewerEngine:
         model_supplier: Optional[Callable[[], Dict[str, Any]]] = None,
         defaults: Optional[Dict[str, Any]] = None,
         max_upload_bytes: int = 100 * 1024 * 1024,
+        output_root: Optional[str] = None,
     ):
         self._model_supplier = model_supplier
         self._models: Optional[Dict[str, Any]] = None
         self.max_upload_bytes = max_upload_bytes
+        self.output_root = os.path.abspath(output_root or settings.OUTPUT_DIR)
         self.defaults = defaults or {
             "mode": "auto",
             "force_ocr": False,
@@ -229,6 +235,10 @@ class ViewerEngine:
                 pass
             raise ValueError(f"Could not read document: {exc}") from exc
 
+        stem = os.path.splitext(raw_name)[0]
+        if not stem or stem in (".", ".."):
+            stem = "document"
+        out_folder = os.path.join(self.output_root, stem)
         with self.docs_lock:
             self.docs[did] = {
                 "id": did,
@@ -236,6 +246,11 @@ class ViewerEngine:
                 "filename": raw_name,
                 "ext": ext,
                 "pages": max(1, num_pages),
+                "stem": stem,
+                "out_folder": out_folder,
+                "images_folder": os.path.join(out_folder, "images"),
+                "page_order": [],
+                "saved_pages": {},
             }
             while len(self.docs) > 24:
                 old_id = next(iter(self.docs))
@@ -251,6 +266,22 @@ class ViewerEngine:
             "pages": max(1, num_pages),
             "filename": raw_name,
         }
+
+    def prepare(self, did: str, page_indices: List[int]) -> Dict[str, Any]:
+        with self.docs_lock:
+            doc_info = self.docs.get(did)
+        if doc_info is None:
+            raise ValueError("Document not found — please upload the file again.")
+
+        out_folder = doc_info["out_folder"]
+        if os.path.isdir(out_folder):
+            shutil.rmtree(out_folder, ignore_errors=True)
+        os.makedirs(doc_info["images_folder"], exist_ok=True)
+
+        with self.docs_lock:
+            doc_info["page_order"] = [int(p) for p in page_indices]
+            doc_info["saved_pages"] = {}
+        return {"id": did, "output_dir": out_folder}
 
     def page(self, did: str, n: int, opts: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         opts = opts or {}
@@ -350,6 +381,36 @@ class ViewerEngine:
             doc_output = document.render(md_renderer.block_config)
             full_html, extracted_images = md_renderer.extract_html(document, doc_output)
             markdown_str = cleanup_text(md_renderer.md_cls.convert(full_html))
+            markdown_str = make_image_paths_relative(
+                markdown_str, (extracted_images or {}).keys(), "md"
+            )
+
+            images_folder = doc_info["images_folder"]
+            os.makedirs(images_folder, exist_ok=True)
+            for img_name, pil_im in (extracted_images or {}).items():
+                pil_im.convert("RGB").save(
+                    os.path.join(images_folder, img_name),
+                    format=settings.OUTPUT_IMAGE_FORMAT,
+                )
+
+            with self.docs_lock:
+                doc_info["saved_pages"][n] = markdown_str
+                page_order = doc_info["page_order"] or sorted(
+                    doc_info["saved_pages"]
+                )
+                combined_markdown = "\n\n---\n\n".join(
+                    doc_info["saved_pages"][p]
+                    for p in page_order
+                    if p in doc_info["saved_pages"]
+                )
+                os.makedirs(doc_info["out_folder"], exist_ok=True)
+                markdown_path = os.path.join(
+                    doc_info["out_folder"], f"{doc_info['stem']}.md"
+                )
+                with open(
+                    markdown_path, "w", encoding=settings.OUTPUT_ENCODING
+                ) as markdown_file:
+                    markdown_file.write(combined_markdown)
 
             img_fmt = settings.OUTPUT_IMAGE_FORMAT.lower()
             encoded_images: Dict[str, str] = {}
@@ -534,6 +595,38 @@ class ViewerEngine:
                 "timings": timings,
             }
 
+    def download_zip(self, did: str) -> tuple[bytes, str]:
+        with self.docs_lock:
+            doc_info = self.docs.get(did)
+        if doc_info is None:
+            raise ValueError("Document not found — please upload the file again.")
+
+        out_folder = doc_info["out_folder"]
+        stem = doc_info["stem"]
+        markdown_path = os.path.join(out_folder, f"{stem}.md")
+        if not os.path.isfile(markdown_path):
+            raise ValueError("No converted output is available to download yet.")
+
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.write(markdown_path, arcname=f"{stem}.md")
+            images_folder = doc_info["images_folder"]
+            image_names = []
+            if os.path.isdir(images_folder):
+                image_names = sorted(
+                    name
+                    for name in os.listdir(images_folder)
+                    if os.path.isfile(os.path.join(images_folder, name))
+                )
+            for img_name in image_names:
+                zf.write(
+                    os.path.join(images_folder, img_name),
+                    arcname=f"images/{img_name}",
+                )
+            if not image_names:
+                zf.writestr("images/", b"")
+        return archive.getvalue(), f"{stem}.zip"
+
 
 def render_viewer_html() -> str:
     return PAGE.replace("__LOGO__", LOGO)
@@ -550,18 +643,37 @@ def make_handler(engine: ViewerEngine):
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
+            for key, value in getattr(self, "_response_headers", {}).items():
+                self.send_header(key, value)
             self.end_headers()
             self.wfile.write(body)
 
         def do_GET(self):
-            if self.path in ("/", "/index.html"):
+            parsed = urllib.parse.urlparse(self.path)
+            if parsed.path in ("/", "/index.html"):
                 self._send(
                     200,
                     render_viewer_html().encode("utf-8"),
                     "text/html; charset=utf-8",
                 )
-            elif self.path == "/info":
+            elif parsed.path == "/info":
                 self._send(200, json.dumps(engine.info(has_api_docs=False)).encode("utf-8"))
+            elif parsed.path == "/download":
+                did = urllib.parse.parse_qs(parsed.query).get("id", [""])[0]
+                try:
+                    data, filename = engine.download_zip(did)
+                except ValueError as exc:
+                    return self._send(
+                        400, json.dumps({"error": str(exc)}).encode("utf-8")
+                    )
+                self._response_headers = {
+                    "Content-Disposition": (
+                        "attachment; filename*=UTF-8''"
+                        + urllib.parse.quote(filename)
+                    )
+                }
+                self._send(200, data, "application/zip")
+                self._response_headers = {}
             else:
                 self._send(404, b"not found", "text/plain")
 
@@ -570,11 +682,16 @@ def make_handler(engine: ViewerEngine):
             body = self.rfile.read(length)
             try:
                 if self.path == "/upload":
-                    fname = self.headers.get("X-Filename", "document.pdf")
+                    fname = urllib.parse.unquote(
+                        self.headers.get("X-Filename", "document.pdf")
+                    )
                     res = engine.upload(body, filename=fname)
                 elif self.path == "/page":
                     q = json.loads(body)
                     res = engine.page(q["id"], int(q["n"]), q.get("opts", {}))
+                elif self.path == "/prepare":
+                    q = json.loads(body)
+                    res = engine.prepare(q["id"], q.get("pages", []))
                 else:
                     return self._send(404, b"not found", "text/plain")
                 self._send(200, json.dumps(res).encode("utf-8"))
@@ -768,7 +885,7 @@ footer{padding:18px 24px;border-top:var(--hairline) solid var(--rule);display:fl
  <div class="group"><div class="label">Run</div>
   <div id="status"></div>
   <div id="stats"></div>
-  <button class="btn-sec" id="dl-md" hidden>Download full Markdown (.md)</button>
+  <button class="btn-sec" id="dl-md" hidden>Download Markdown (.zip)</button>
  </div>
  <div class="callout">Need handwriting, complex forms, and highest-accuracy VLM parsing at scale? <a href="https://www.datalab.to/?utm_source=marker-viewer" target="_blank" rel="noopener">Chandra on Datalab</a> includes 5,000 free pages/month with a work email.</div>
 </aside>
@@ -779,7 +896,7 @@ footer{padding:18px 24px;border-top:var(--hairline) solid var(--rule);display:fl
    <div class="pbadge" id="pbadge" hidden>✓</div>
    <div class="ptitle" id="ptitle">Converting document…</div>
    <div class="psub" id="psub">0 / 0 pages · 0.0s</div>
-   <button class="btn-sec" id="pbanner-dl" hidden>Download .md</button>
+   <button class="btn-sec" id="pbanner-dl" hidden>Download .zip</button>
   </div>
   <div class="ptrack"><div class="pfill indet" id="pfill" style="width:0%"></div></div>
  </div>
@@ -845,10 +962,11 @@ drop.ondragover=e=>{e.preventDefault();drop.classList.add('over')};drop.ondragle
 drop.ondrop=e=>{e.preventDefault();drop.classList.remove('over');e.dataTransfer.files[0]&&start(e.dataTransfer.files[0])};
 $('#rerun').onclick=()=>doc&&run();
 function dlMarkdown(){
- if(!pagesMd.length)return;
- const blob=new Blob([pagesMd.join('\n\n---\n\n')],{type:'text/markdown;charset=utf-8'});
- const a=document.createElement('a');a.href=URL.createObjectURL(blob);
- a.download=((doc&&doc.name)||'document').replace(/\.[^.]+$/,'')+'.md';a.click();
+ if(!doc)return;
+ const a=document.createElement('a');
+ a.href='/download?id='+encodeURIComponent(doc.id);
+ a.download=((doc&&doc.name)||'document').replace(/\.[^.]+$/,'')+'.zip';
+ document.body.appendChild(a);a.click();a.remove();
 }
 $('#dl-md').onclick=dlMarkdown;
 $('#pbanner-dl').onclick=dlMarkdown;
@@ -937,6 +1055,15 @@ async function run(){
  const pageList=parsePageIndices($('#prange').value,doc.pages,maxP);
  if(!pageList.length){setBanner('err','No valid pages in range (0..'+(doc.pages-1)+')','',100,false);return;}
  $('#out').innerHTML='';stats=[];pagesMd=[];$('#dl-md').hidden=true;summary();
+ try{
+  const pr=await fetch('/prepare',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:doc.id,pages:pageList}),signal:ctrl.signal});
+  const pres=await pr.json();
+  if(!pr.ok||pres.error||pres.detail)throw new Error(pres.error||pres.detail||pr.statusText);
+ }catch(err){
+  if(id!==runId||(err&&err.name==='AbortError'))return;
+  setBanner('err','Could not prepare output folder: '+(err&&err.message?err.message:String(err)),'',100,false);
+  return;
+ }
  const inflight=document.createElement('div');
  inflight.className='inflight';
  const infSpin=document.createElement('div');infSpin.className='spin';

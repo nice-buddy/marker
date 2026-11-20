@@ -74,6 +74,10 @@ class OcrBuilder(BaseBuilder):
         str,
         "Conversion mode ('no_ocr' | 'fast' | 'indra' | 'balanced' | 'vllm').",
     ] = "balanced"
+    force_ocr: Annotated[
+        bool,
+        "Force OCR on every page.",
+    ] = False
     ocr_backend: Annotated[
         str,
         "OCR backend: 'auto' (Indra ONNX in fast mode, Surya VLM in balanced mode), 'indra', or 'surya'.",
@@ -265,7 +269,9 @@ class OcrBuilder(BaseBuilder):
                 # full-page output fails or loops. When layout was skipped
                 # (force_ocr), pass None so surya lazily runs its own layout
                 # for just the pages that need the fallback.
-                if all(len(layout.bboxes) == 0 for layout in layout_results):
+                if self.force_ocr or all(
+                    len(layout.bboxes) == 0 for layout in layout_results
+                ):
                     layout_results = None
                 try:
                     recognition_results = rec_model(
@@ -662,11 +668,22 @@ class OcrBuilder(BaseBuilder):
         Works for both full-page results and the per-page block-mode fallback,
         since both return blocks with polygon, label, and html.
         """
+        image_block_types = (
+            BlockTypes.Figure,
+            BlockTypes.Picture,
+            BlockTypes.Diagram,
+        )
         for page, image, page_result in zip(pages, images, recognition_results):
             image_size = image.size
             page_size = page.polygon.size
+            preserved_images = [
+                block
+                for block in page.structure_blocks(document)
+                if block.block_type in image_block_types
+            ]
 
             new_structure = []
+            new_image_boxes = []
             for block_result in page_result.blocks:
                 block_type = surya_label_to_block_type(block_result.label)
                 if block_type is None:
@@ -692,10 +709,35 @@ class OcrBuilder(BaseBuilder):
                     if html:
                         block.html = html
                 new_structure.append(block.id)
+                if block_type in image_block_types:
+                    new_image_boxes.append(block.polygon.bbox)
 
-            # Retire the layout blocks the page structure previously pointed to
+            # Full-page OCR does not return picture/figure blocks, so carry
+            # them over from the layout pass and place them by vertical position.
+            for image_block in preserved_images:
+                x0, y0, x1, y1 = image_block.polygon.bbox
+                center_x = (x0 + x1) / 2
+                center_y = (y0 + y1) / 2
+                if any(
+                    bx0 <= center_x <= bx1 and by0 <= center_y <= by1
+                    for bx0, by0, bx1, by1 in new_image_boxes
+                ):
+                    image_block.removed = True
+                    continue
+                image_block.removed = False
+                insert_at = len(new_structure)
+                for idx, block_id in enumerate(new_structure):
+                    if page.get_block(block_id).polygon.bbox[1] > y0:
+                        insert_at = idx
+                        break
+                new_structure.insert(insert_at, image_block.id)
+
+            preserved_ids = {block.id for block in preserved_images}
+            # Retire the layout blocks the page structure previously pointed to,
+            # except for the picture blocks we are preserving.
             for old_block in page.structure_blocks(document):
-                old_block.removed = True
+                if old_block.id not in preserved_ids:
+                    old_block.removed = True
             page.structure = new_structure
 
     def apply_block_html(

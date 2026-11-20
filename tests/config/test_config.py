@@ -96,6 +96,17 @@ def test_config_mode_auto_and_headers_footers(tmp_path):
     assert out_folder.endswith("sub/nested/report")
 
 
+def test_default_output_dir_beside_virtualenv(tmp_path, monkeypatch):
+    from marker.settings import _default_output_dir
+
+    venv = tmp_path / "app" / ".venv"
+    venv.mkdir(parents=True)
+    (venv / "pyvenv.cfg").write_text("")
+    monkeypatch.setattr("marker.settings.sys.prefix", str(venv))
+
+    assert _default_output_dir() == str(tmp_path / "app" / "outputs")
+
+
 def test_discover_input_files_and_skills(tmp_path):
     from click.testing import CliRunner
     from marker.scripts.convert import convert_cli, discover_input_files

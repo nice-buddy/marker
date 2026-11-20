@@ -78,11 +78,25 @@ def convert_if_not_rgb(image: Image.Image) -> Image.Image:
     return image
 
 
+def make_image_paths_relative(text: str, image_names, ext: str) -> str:
+    """Point saved image references at the sibling ``images`` directory."""
+    for img_name in image_names:
+        rel_name = f"images/{img_name}"
+        if ext == "md":
+            text = text.replace(f"]({img_name})", f"]({rel_name})")
+        text = text.replace(f'src="{img_name}"', f'src="{rel_name}"')
+        text = text.replace(f"src='{img_name}'", f"src='{rel_name}'")
+    return text
+
+
 def save_output(rendered: BaseModel, output_dir: str, fname_base: str):
     text, ext, images = text_from_rendered(rendered)
     text = text.encode(settings.OUTPUT_ENCODING, errors="replace").decode(
         settings.OUTPUT_ENCODING
     )
+    images_dir = os.path.join(output_dir, "images")
+    os.makedirs(images_dir, exist_ok=True)
+    text = make_image_paths_relative(text, images, ext)
 
     with open(
         os.path.join(output_dir, f"{fname_base}.{ext}"),
@@ -99,4 +113,4 @@ def save_output(rendered: BaseModel, output_dir: str, fname_base: str):
 
     for img_name, img in images.items():
         img = convert_if_not_rgb(img)  # RGBA images can't save as JPG
-        img.save(os.path.join(output_dir, img_name), settings.OUTPUT_IMAGE_FORMAT)
+        img.save(os.path.join(images_dir, img_name), settings.OUTPUT_IMAGE_FORMAT)
