@@ -816,7 +816,16 @@ def make_handler(engine: ViewerEngine):
             body = self.rfile.read(length)
             try:
                 parsed = urllib.parse.urlparse(self.path)
-                if parsed.path == "/api/tasks":
+                if parsed.path == "/api/tasks/reorder":
+                    q = json.loads(body or b"{}")
+                    res = get_task_manager().reorder_queued(
+                        q.get("task_ids", [])
+                    )
+                elif match := re.fullmatch(
+                    r"/api/tasks/([^/]+)/cancel", parsed.path
+                ):
+                    res = get_task_manager().cancel_task(match.group(1))
+                elif parsed.path == "/api/tasks":
                     filename = urllib.parse.unquote(
                         self.headers.get("X-Filename", "document.pdf")
                     )
@@ -868,6 +877,27 @@ def make_handler(engine: ViewerEngine):
                 logger.warning(f"Viewer request error: {exc}")
                 self._send(
                     400,
+                    json.dumps(
+                        {"error": str(exc)}, ensure_ascii=False
+                    ).encode("utf-8"),
+                )
+
+        def do_DELETE(self):
+            parsed = urllib.parse.urlparse(self.path)
+            match = re.fullmatch(r"/api/tasks/([^/]+)", parsed.path)
+            if not match:
+                return self._send(404, b"not found", "text/plain")
+            try:
+                get_task_manager().delete_task(match.group(1))
+                self._send(
+                    200,
+                    json.dumps(
+                        {"success": True}, ensure_ascii=False
+                    ).encode("utf-8"),
+                )
+            except Exception as exc:
+                self._send(
+                    409,
                     json.dumps(
                         {"error": str(exc)}, ensure_ascii=False
                     ).encode("utf-8"),
@@ -974,7 +1004,7 @@ main{padding:24px;display:flex;flex-direction:column;gap:24px;min-width:0}
 .meta{font:12px var(--font-mono);color:var(--ink-3)}.ch .sp{flex:1}
 .tbar{display:flex;height:6px;border-radius:3px;overflow:hidden;background:var(--surface-2);width:170px}.tbar i{display:block;height:100%}
 .body{display:grid;grid-template-columns:minmax(0,1.05fr) minmax(0,1fr);min-height:440px;align-items:start}
-@media(max-width:1200px){.body{grid-template-columns:1fr}.pane{max-height:70vh}}
+@media(max-width:1200px){.body{grid-template-columns:1fr}.pane{flex:1 1 auto;max-height:70vh}}
 .pageview{padding:16px;background:var(--surface);border-right:var(--hairline) solid var(--rule)}
 svg.pg{width:100%;height:auto;display:block;background:#fff;box-shadow:0 1px 2px oklch(18% .012 263 / .08),0 0 0 var(--hairline) var(--rule)}
 .right{display:flex;flex-direction:column;min-width:0;min-height:0;overflow:hidden}
@@ -984,7 +1014,7 @@ svg.pg{width:100%;height:auto;display:block;background:#fff;box-shadow:0 1px 2px
 .tabs .sp{flex:1}
 .tabs .copy-btn{font:500 11px var(--font-mono);padding:4px 8px;margin-bottom:4px;border:var(--hairline) solid var(--rule);border-radius:5px;background:var(--surface);color:var(--ink-2)}
 .tabs .copy-btn:hover{background:var(--surface-2)}
-.pane{flex:1 1 auto;min-height:0;overflow:auto;padding:14px 16px}
+.pane{flex:1 1 0;min-height:0;overflow:auto;padding:14px 16px}
 .pane.src{white-space:pre-wrap;font:12.5px/1.6 var(--font-mono);color:var(--ink-2)}
 .preview{font-size:14px;line-height:1.6}
 .preview h1,.preview h2,.preview h3,.preview h4{letter-spacing:-.015em;line-height:1.25;margin:1em 0 .4em}
@@ -1018,10 +1048,15 @@ footer{padding:18px 24px;border-top:var(--hairline) solid var(--rule);display:fl
 .hist-item{border:var(--hairline) solid var(--rule);background:#fff;border-radius:7px;padding:8px 9px;text-align:left;cursor:pointer;font:12px var(--font-body);color:var(--ink-2)}
 .hist-item:hover{background:var(--surface)}
 .hist-item.active{border-color:var(--accent);background:var(--accent-soft)}
+.hist-item[draggable="true"]{cursor:grab}
+.hist-item.dragging{opacity:.4}
+.hist-item.drop-target{border-color:var(--accent);background:var(--accent-soft)}
 .hist-name{display:block;font-weight:600;color:var(--ink);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .hist-meta{display:block;margin-top:3px;font:11px var(--font-mono);color:var(--ink-3)}
 .pager{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 .pager .sp{flex:1}
+.task-actions{display:flex;gap:8px;flex-wrap:wrap}
+.btn-sec.danger{color:var(--err);border-color:var(--err)}
 </style></head><body>
 <div class="top">
  <div class="brand"><img class="mark" src="data:image/png;base64,__LOGO__" alt="Datalab">Datalab<span class="sep">/</span><span class="prod">Marker</span></div>
@@ -1036,6 +1071,7 @@ footer{padding:18px 24px;border-top:var(--hairline) solid var(--rule);display:fl
   <div id="fname"></div>
  </div>
  <div class="group"><div class="label">历史记录</div>
+  <div class="hint">排队中的任务可拖动调整顺序</div>
   <div id="history" class="history"><div class="hint">暂无转换记录</div></div>
  </div>
  <div class="group"><div class="label">转换模式</div>
@@ -1071,6 +1107,10 @@ footer{padding:18px 24px;border-top:var(--hairline) solid var(--rule);display:fl
  <div class="group"><div class="label">状态</div>
   <div id="status"></div>
   <div id="stats"></div>
+  <div class="task-actions">
+   <button class="btn-sec danger" id="cancel-task" hidden>终止任务</button>
+   <button class="btn-sec danger" id="delete-task" hidden>删除任务</button>
+  </div>
   <button class="btn-sec" id="dl-md" hidden>下载 Markdown（.zip）</button>
  </div>
  <div class="callout">需要更高精度的手写、复杂表单和 VLM 解析？可使用 <a href="https://www.datalab.to/?utm_source=marker-viewer" target="_blank" rel="noopener">Datalab Chandra</a>。</div>
@@ -1155,6 +1195,7 @@ const HINT={
 let mode="auto",activeTask=null,historyTasks=[],stats=[],pollTimer=null,pollSeq=0;
 let currentPage=1,pageSize=10,windowSeq=0;
 let currentWindowIndices=[],renderedCompleted=new Set();
+let draggingTaskId=null,isDragging=false,justDragged=false;
 function syncRightHeight(card){
  const page=card.querySelector('.pageview'),right=card.querySelector('.right');
  if(!page||!right)return;
@@ -1265,9 +1306,20 @@ function stopPolling(){pollSeq++;if(pollTimer){clearInterval(pollTimer);pollTime
 function statusLabel(task){
  if(task.status==='running')return '转换中';
  if(task.status==='queued')return task.queue_position?`排队中（第 ${task.queue_position} 位）`:'排队中';
+ if(task.status==='cancelling')return '正在终止';
+ if(task.status==='cancelled')return '已取消';
  if(task.status==='completed')return '已完成';
  if(task.status==='failed')return '失败';
  return task.status||'未知';
+}
+function fmtDuration(seconds){
+ if(seconds==null||!Number.isFinite(seconds)||seconds<0)return '—';
+ if(seconds<60)return `${seconds.toFixed(1)} 秒`;
+ const minutes=Math.floor(seconds/60),rest=Math.round(seconds%60);
+ return `${minutes} 分 ${rest} 秒`;
+}
+function elapsedLabel(task){
+ return task.started_at?fmtDuration(task.elapsed_seconds):'—';
 }
 async function apiJson(url,options){
  const r=await fetch(url,options);
@@ -1278,11 +1330,18 @@ async function apiJson(url,options){
 function updateTaskBanner(task){
  const total=Math.max(1,task.total_selected||0),done=task.completed_count||0;
  const pct=Math.round(done*100/total);
- if(task.status==='completed')setBanner('done',`已完成：${task.task_name}`,`${done} / ${total} 页`,100,false);
- else if(task.status==='failed')setBanner('err',`转换失败：${task.task_name}`,task.error||`${done} / ${total} 页`,pct,false);
+ const elapsed=elapsedLabel(task);
+ if(task.status==='completed')setBanner('done',`已完成：${task.task_name}`,`${done} / ${total} 页 · 总耗时 ${elapsed}`,100,false);
+ else if(task.status==='failed')setBanner('err',`转换失败：${task.task_name}`,`${done} / ${total} 页 · 耗时 ${elapsed}`,pct,false);
+ else if(task.status==='cancelled')setBanner('err',`已取消：${task.task_name}`,`${done} / ${total} 页 · 耗时 ${elapsed}`,pct,false);
+ else if(task.status==='cancelling')setBanner('run',`正在终止：${task.task_name}`,`${done} / ${total} 页 · 已用 ${elapsed}`,pct,false);
  else if(task.status==='queued')setBanner('run',`排队中：${task.task_name}`,`${statusLabel(task)} · ${done} / ${total} 页`,pct,true);
- else setBanner('run',`正在转换：${task.task_name}`,`${done} / ${total} 页`,pct,false);
- $('#rerun').hidden=task.status!=='failed';
+ else setBanner('run',`正在转换：${task.task_name}`,`${done} / ${total} 页 · 已用 ${elapsed}`,pct,false);
+ $('#rerun').hidden=!['failed','cancelled'].includes(task.status);
+ $('#cancel-task').hidden=!['queued','running','cancelling'].includes(task.status);
+ $('#cancel-task').disabled=task.status==='cancelling';
+ $('#cancel-task').textContent=task.status==='cancelling'?'正在终止…':'终止任务';
+ $('#delete-task').hidden=['running','cancelling'].includes(task.status);
  $('#dl-md').hidden=done<=0;
 }
 async function loadHistory(autoSelect=false){
@@ -1304,9 +1363,57 @@ function renderHistory(){
  const el=$('#history');
  if(!historyTasks.length){el.innerHTML='<div class="hint">暂无转换记录</div>';return}
  const scrollTop=el.scrollTop;
- el.innerHTML=historyTasks.map(t=>`<button class="hist-item ${activeTask&&activeTask.id===t.id?'active':''}" data-id="${esc(t.id)}"><span class="hist-name">${esc(t.task_name)}</span><span class="hist-meta">${esc(statusLabel(t))} · ${t.completed_count||0}/${t.total_selected||0} 页</span></button>`).join('');
+ el.innerHTML=historyTasks.map(t=>`<button class="hist-item ${activeTask&&activeTask.id===t.id?'active':''}" data-id="${esc(t.id)}" data-status="${esc(t.status)}" draggable="${t.status==='queued'?'true':'false'}"><span class="hist-name">${esc(t.task_name)}</span><span class="hist-meta">${esc(statusLabel(t))} · ${t.completed_count||0}/${t.total_selected||0} 页 · 耗时 ${elapsedLabel(t)}</span></button>`).join('');
  el.scrollTop=scrollTop;
- el.querySelectorAll('.hist-item').forEach(b=>b.onclick=()=>selectTask(b.dataset.id,1));
+ el.querySelectorAll('.hist-item').forEach(item=>{
+  item.onclick=()=>{if(!justDragged)selectTask(item.dataset.id,1)};
+  if(item.dataset.status!=='queued')return;
+  item.ondragstart=e=>{
+   draggingTaskId=item.dataset.id;isDragging=true;
+   e.dataTransfer.effectAllowed='move';
+   e.dataTransfer.setData('text/plain',draggingTaskId);
+   item.classList.add('dragging');
+  };
+  item.ondragend=()=>{
+   isDragging=false;draggingTaskId=null;justDragged=true;
+   setTimeout(()=>justDragged=false,150);
+   renderHistory();
+  };
+  item.ondragover=e=>{
+   if(!draggingTaskId||draggingTaskId===item.dataset.id)return;
+   e.preventDefault();item.classList.add('drop-target');
+  };
+  item.ondragleave=()=>item.classList.remove('drop-target');
+  item.ondrop=async e=>{
+   e.preventDefault();
+   const targetId=item.dataset.id;
+   if(!draggingTaskId||draggingTaskId===targetId)return;
+   const before=e.clientY<item.getBoundingClientRect().top+item.offsetHeight/2;
+   await reorderQueuedTasks(draggingTaskId,targetId,before);
+  };
+ });
+}
+async function reorderQueuedTasks(dragId,targetId,before){
+ const queued=historyTasks.filter(t=>t.status==='queued').map(t=>t.id);
+ const from=queued.indexOf(dragId);
+ if(from<0)return;
+ queued.splice(from,1);
+ let to=queued.indexOf(targetId);
+ if(to<0)return;
+ if(!before)to+=1;
+ queued.splice(to,0,dragId);
+ isDragging=false;draggingTaskId=null;justDragged=true;
+ setTimeout(()=>justDragged=false,150);
+ try{
+  historyTasks=await apiJson('/api/tasks/reorder',{
+   method:'POST',headers:{'Content-Type':'application/json'},
+   body:JSON.stringify({task_ids:queued})
+  });
+  renderHistory();
+ }catch(err){
+  setBanner('err','调整队列顺序失败：'+err.message,'',0,false);
+  await loadHistory();
+ }
 }
 function applyTaskOptions(o){
  if(o.mode)setMode(o.mode);
@@ -1377,14 +1484,14 @@ function pollActiveTask(){
    const task=await apiJson('/api/tasks/'+encodeURIComponent(id));
    activeTask=task;
    updateTaskBanner(task);
-   renderHistory();
+   if(!isDragging)renderHistory();
    const hasNewPage=(task.completed_pages||[]).some(
     page=>currentWindowIndices.includes(page)&&!renderedCompleted.has(page)
    );
    if(hasNewPage){
     await loadPageWindow(id,currentPage);
    }
-   if(task.status==='completed'||task.status==='failed')stopPolling();
+   if(['completed','failed','cancelled'].includes(task.status))stopPolling();
   }catch(_){}
  },1000);
 }
@@ -1397,8 +1504,40 @@ async function retryActiveTask(){
   setBanner('err','重试失败：'+err.message,'',0,false);
  }
 }
+async function cancelActiveTask(){
+ if(!activeTask)return;
+ try{
+  const task=await apiJson('/api/tasks/'+encodeURIComponent(activeTask.id)+'/cancel',{method:'POST'});
+  activeTask=task;updateTaskBanner(task);renderHistory();
+  await selectTask(task.id,currentPage);
+ }catch(err){
+  setBanner('err','终止任务失败：'+err.message,'',0,false);
+ }
+}
+async function deleteActiveTask(){
+ if(!activeTask)return;
+ const id=activeTask.id,name=activeTask.task_name;
+ if(!confirm(`确定删除任务“${name}”？\n将删除输入文件、转换结果和历史记录。`))return;
+ try{
+  await apiJson('/api/tasks/'+encodeURIComponent(id),{method:'DELETE'});
+  stopPolling();
+  localStorage.removeItem('marker_active_task');
+  localStorage.removeItem('marker_page_'+id);
+  activeTask=null;currentWindowIndices=[];renderedCompleted=new Set();
+  $('#out').innerHTML='<div class="empty"><h2>转换文档</h2>拖放 PDF、图片或 Office 文档。转换结果会按页分页展示，历史任务可随时恢复。</div>';
+  $('#pager').hidden=true;$('#pbanner').hidden=true;
+  $('#status').textContent='';$('#stats').innerHTML='';$('#fname').textContent='';
+  $('#cancel-task').hidden=true;$('#delete-task').hidden=true;
+  $('#rerun').hidden=true;$('#dl-md').hidden=true;
+  await loadHistory(true);
+ }catch(err){
+  setBanner('err','删除任务失败：'+err.message,'',0,false);
+ }
+}
 $('#prev-page').onclick=()=>activeTask&&loadPageWindow(activeTask.id,currentPage-1);
 $('#next-page').onclick=()=>activeTask&&loadPageWindow(activeTask.id,currentPage+1);
+$('#cancel-task').onclick=cancelActiveTask;
+$('#delete-task').onclick=deleteActiveTask;
 
 function summary(){
  const el=$('#stats');if(!stats.length){el.innerHTML='';return}

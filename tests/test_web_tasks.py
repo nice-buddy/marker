@@ -3,7 +3,11 @@ import re
 
 import pytest
 
-from marker.scripts.web_tasks import TaskManager, TaskStore
+from marker.scripts.web_tasks import (
+    TaskManager,
+    TaskStore,
+    _task_elapsed_seconds,
+)
 
 pytestmark = pytest.mark.cpu
 
@@ -168,3 +172,82 @@ def test_recover_running_task_requeues_it(tmp_path, monkeypatch):
     recovered = manager.get_task(task["id"])
     assert recovered["status"] == "queued"
     assert recovered["current_page"] is None
+
+
+def test_cancel_queued_retry_and_delete(tmp_path, monkeypatch):
+    manager = _make_manager(tmp_path, monkeypatch)
+    task = _create_task(manager)
+
+    cancelled = manager.cancel_task(task["id"])
+    assert cancelled["status"] == "cancelled"
+    assert manager.store.claim_next_queued() is None
+
+    manager.retry_task(task["id"])
+    claimed = manager.store.claim_next_queued()
+    assert claimed["status"] == "running"
+    assert manager._process_task(claimed)
+    assert manager.get_task(task["id"])["status"] == "completed"
+
+    input_path = task["input_path"]
+    output_dir = task["output_dir"]
+    page_dir = os.path.join(manager.history_dir, "pages", task["id"])
+    assert os.path.exists(input_path)
+    assert os.path.isdir(output_dir)
+    assert os.path.isdir(page_dir)
+
+    assert manager.delete_task(task["id"])
+    assert not os.path.exists(input_path)
+    assert not os.path.exists(output_dir)
+    assert not os.path.exists(page_dir)
+    assert manager.list_tasks() == []
+
+
+def test_cancel_running_task(tmp_path, monkeypatch):
+    manager = _make_manager(tmp_path, monkeypatch)
+    task = _create_task(manager)
+    claimed = manager.store.claim_next_queued()
+
+    cancelling = manager.cancel_task(task["id"])
+    assert cancelling["status"] == "cancelling"
+    assert manager._process_task(claimed)
+
+    cancelled = manager.get_task(task["id"])
+    assert cancelled["status"] == "cancelled"
+    assert cancelled["completed_pages"] == []
+    assert manager.engine.calls == []
+
+
+def test_reorder_queued_tasks(tmp_path, monkeypatch):
+    manager = _make_manager(tmp_path, monkeypatch)
+    task1 = _create_task(manager)
+    task2 = _create_task(manager)
+    task3 = _create_task(manager)
+
+    manager.reorder_queued([task3["id"], task1["id"], task2["id"]])
+    queued_order = [
+        t["id"] for t in manager.list_tasks() if t["status"] == "queued"
+    ]
+    assert queued_order == [task3["id"], task1["id"], task2["id"]]
+
+    claimed = manager.store.claim_next_queued()
+    assert claimed["id"] == task3["id"]
+
+
+def test_completed_tasks_sort_to_end_and_elapsed(tmp_path, monkeypatch):
+    manager = _make_manager(tmp_path, monkeypatch)
+    first = _create_task(manager)
+    claimed = manager.store.claim_next_queued()
+    assert manager._process_task(claimed)
+    queued = _create_task(manager)
+
+    tasks = manager.list_tasks()
+    assert tasks[0]["id"] == queued["id"]
+    assert tasks[-1]["id"] == first["id"]
+    assert tasks[-1]["status"] == "completed"
+
+    assert _task_elapsed_seconds(
+        {
+            "started_at": "2026-01-01T00:00:00+00:00",
+            "finished_at": "2026-01-01T00:01:05+00:00",
+        }
+    ) == 65.0

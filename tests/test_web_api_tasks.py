@@ -115,5 +115,56 @@ def test_task_api_queue_and_paginated_results(tmp_path, monkeypatch):
             names = archive.namelist()
         assert "测试.md" in names
         assert "images/page_0.jpg" in names
+
+        delete = client.delete(f"/api/tasks/{task['id']}")
+        assert delete.status_code == 200
+        assert delete.json()["success"] is True
+        assert client.get("/api/tasks").json() == []
     finally:
         manager.stop()
+
+
+def test_task_api_reorder_cancel_and_delete(tmp_path, monkeypatch):
+    manager = TaskManager(
+        QueueFakeEngine(),
+        store=TaskStore(str(tmp_path / "history" / "tasks.sqlite3")),
+        input_dir=str(tmp_path / "inputs"),
+        output_dir=str(tmp_path / "outputs"),
+        history_dir=str(tmp_path / "history"),
+    )
+    monkeypatch.setattr(server_mod, "task_manager", manager)
+    monkeypatch.setattr(TaskManager, "start", lambda self: None)
+    monkeypatch.setattr(
+        TaskManager, "_count_pages", staticmethod(lambda *args: 1)
+    )
+    client = TestClient(server_mod.app)
+
+    tasks = []
+    for name in ("1.png", "2.png", "3.png"):
+        response = client.post(
+            "/api/tasks",
+            params={"mode": "no_ocr", "dpi": 150, "max_pages": 10},
+            content=b"image",
+            headers={"X-Filename": name},
+        )
+        assert response.status_code == 200
+        tasks.append(response.json())
+
+    reordered = client.post(
+        "/api/tasks/reorder",
+        json={"task_ids": [tasks[2]["id"], tasks[0]["id"], tasks[1]["id"]]},
+    )
+    assert reordered.status_code == 200
+    queued = [t["id"] for t in reordered.json() if t["status"] == "queued"]
+    assert queued == [tasks[2]["id"], tasks[0]["id"], tasks[1]["id"]]
+
+    cancelled = client.post(f"/api/tasks/{tasks[1]['id']}/cancel")
+    assert cancelled.status_code == 200
+    assert cancelled.json()["status"] == "cancelled"
+
+    deleted = client.delete(f"/api/tasks/{tasks[0]['id']}")
+    assert deleted.status_code == 200
+    remaining = [t["id"] for t in client.get("/api/tasks").json()]
+    assert tasks[0]["id"] not in remaining
+    assert tasks[1]["id"] in remaining
+    assert tasks[2]["id"] in remaining

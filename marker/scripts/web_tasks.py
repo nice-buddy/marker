@@ -5,6 +5,7 @@ import json
 import math
 import os
 import re
+import shutil
 import sqlite3
 import threading
 import time
@@ -49,6 +50,23 @@ def _dump_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
+def _task_elapsed_seconds(task: Dict[str, Any]) -> float:
+    started = task.get("started_at")
+    if not started:
+        return 0.0
+    try:
+        start = datetime.fromisoformat(started)
+        finished = task.get("finished_at")
+        end = (
+            datetime.fromisoformat(finished)
+            if finished
+            else datetime.now().astimezone()
+        )
+        return max(0.0, (end - start).total_seconds())
+    except Exception:
+        return 0.0
+
+
 class TaskStore:
     """SQLite-backed task and page completion store."""
 
@@ -78,6 +96,7 @@ class TaskStore:
                     input_path TEXT NOT NULL,
                     output_dir TEXT NOT NULL,
                     markdown_name TEXT NOT NULL,
+                    queue_order INTEGER NOT NULL DEFAULT 0,
                     total_pages INTEGER NOT NULL,
                     selected_pages TEXT NOT NULL,
                     status TEXT NOT NULL,
@@ -103,6 +122,21 @@ class TaskStore:
                     ON task_pages(task_id, page_index);
                 """
             )
+            columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(tasks)").fetchall()
+            }
+            if "queue_order" not in columns:
+                conn.execute(
+                    "ALTER TABLE tasks ADD COLUMN queue_order "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+                conn.execute(
+                    """
+                    UPDATE tasks
+                    SET queue_order = CAST(substr(task_name, 1, 17) AS INTEGER)
+                    """
+                )
 
     @staticmethod
     def _row_to_task(
@@ -114,6 +148,7 @@ class TaskStore:
         task["completed_pages"] = completed_pages or []
         task["completed_count"] = len(task["completed_pages"])
         task["total_selected"] = len(task["selected_pages"])
+        task["elapsed_seconds"] = round(_task_elapsed_seconds(task), 1)
         task["queue_position"] = None
         return task
 
@@ -123,7 +158,11 @@ class TaskStore:
             SELECT id, status
             FROM tasks
             WHERE status IN ('running', 'queued')
-            ORDER BY task_name, id
+            ORDER BY
+                CASE status WHEN 'running' THEN 0 ELSE 1 END,
+                queue_order,
+                task_name,
+                id
             """
         ).fetchall()
         positions: Dict[str, int] = {}
@@ -165,7 +204,16 @@ class TaskStore:
                        (SELECT COUNT(*) FROM task_pages p WHERE p.task_id = t.id)
                            AS completed_count
                 FROM tasks t
-                ORDER BY t.task_name DESC, t.id DESC
+                ORDER BY
+                    CASE t.status
+                        WHEN 'running' THEN 0
+                        WHEN 'queued' THEN 1
+                        WHEN 'completed' THEN 3
+                        ELSE 2
+                    END,
+                    CASE WHEN t.status = 'queued' THEN t.queue_order ELSE 0 END,
+                    CASE WHEN t.status != 'queued' THEN t.task_name ELSE '' END DESC,
+                    t.id DESC
                 LIMIT ?
                 """,
                 (limit,),
@@ -185,10 +233,10 @@ class TaskStore:
                 """
                 INSERT INTO tasks (
                     id, task_name, original_filename, input_path, output_dir,
-                    markdown_name, total_pages, selected_pages, status, options,
-                    current_page, error, created_at, started_at, finished_at,
-                    updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    markdown_name, queue_order, total_pages, selected_pages,
+                    status, options, current_page, error, created_at,
+                    started_at, finished_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task["id"],
@@ -197,6 +245,7 @@ class TaskStore:
                     task["input_path"],
                     task["output_dir"],
                     task["markdown_name"],
+                    task.get("queue_order", 0),
                     task["total_pages"],
                     _dump_json(task["selected_pages"]),
                     task["status"],
@@ -225,7 +274,7 @@ class TaskStore:
                 """
                 SELECT id FROM tasks
                 WHERE status = 'queued'
-                ORDER BY task_name, id
+                ORDER BY queue_order, task_name, id
                 LIMIT 1
                 """
             ).fetchone()
@@ -336,11 +385,54 @@ class TaskStore:
                 UPDATE tasks
                 SET status = 'queued', error = NULL, finished_at = NULL,
                     started_at = NULL, current_page = NULL, updated_at = ?
-                WHERE id = ? AND status IN ('failed', 'queued')
+                WHERE id = ? AND status IN ('failed', 'queued', 'cancelled')
                 """,
                 (_now_iso(), task_id),
             )
         return self.get_task(task_id)
+
+    def cancel_task(self, task_id: str) -> Optional[Dict[str, Any]]:
+        now = _now_iso()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT status FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            if row["status"] in ("running", "cancelling"):
+                conn.execute(
+                    """
+                    UPDATE tasks
+                    SET status = 'cancelling', error = '正在终止任务',
+                        updated_at = ?
+                    WHERE id = ? AND status IN ('running', 'cancelling')
+                    """,
+                    (now, task_id),
+                )
+            elif row["status"] == "queued":
+                conn.execute(
+                    """
+                    UPDATE tasks
+                    SET status = 'cancelled', error = '任务已取消',
+                        finished_at = ?, updated_at = ?
+                    WHERE id = ? AND status = 'queued'
+                    """,
+                    (now, now, task_id),
+                )
+        return self.get_task(task_id)
+
+    def mark_cancelled(self, task_id: str) -> None:
+        now = _now_iso()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE tasks
+                SET status = 'cancelled', error = '任务已取消',
+                    finished_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (now, now, task_id),
+            )
 
     def recover_running(self) -> int:
         with self._connect() as conn:
@@ -352,7 +444,57 @@ class TaskStore:
                 """,
                 (_now_iso(),),
             )
+            conn.execute(
+                """
+                UPDATE tasks
+                SET status = 'cancelled', error = '任务已取消',
+                    finished_at = ?, updated_at = ?
+                WHERE status = 'cancelling'
+                """,
+                (_now_iso(), _now_iso()),
+            )
             return cursor.rowcount
+
+    def reorder_queued(self, task_ids: List[str]) -> bool:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id FROM tasks
+                WHERE status = 'queued'
+                ORDER BY queue_order, task_name, id
+                """
+            ).fetchall()
+            current_ids = [row["id"] for row in rows]
+            if len(task_ids) != len(current_ids) or set(task_ids) != set(
+                current_ids
+            ):
+                raise ValueError("排队任务列表已变化，请刷新后重试。")
+            now = _now_iso()
+            for index, task_id in enumerate(task_ids, start=1):
+                conn.execute(
+                    """
+                    UPDATE tasks
+                    SET queue_order = ?, updated_at = ?
+                    WHERE id = ? AND status = 'queued'
+                    """,
+                    (index, now, task_id),
+                )
+            return True
+
+    def delete_task(self, task_id: str) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT status FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if row is None:
+                return False
+            if row["status"] in ("running", "cancelling"):
+                raise ValueError("请先终止正在运行的任务，再删除。")
+            conn.execute(
+                "DELETE FROM task_pages WHERE task_id = ?", (task_id,)
+            )
+            conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+            return True
 
 
 class TaskManager:
@@ -381,11 +523,13 @@ class TaskManager:
         self._lifecycle_lock = threading.Lock()
         self._timestamp_lock = threading.Lock()
         self._last_timestamp = ""
+        self._cancel_events: Dict[str, threading.Event] = {}
 
     def start(self) -> None:
         with self._lifecycle_lock:
             if self._thread is not None and self._thread.is_alive():
                 return
+            self._cancel_events.clear()
             self.store.recover_running()
             self._stop.clear()
             self._thread = threading.Thread(
@@ -475,6 +619,7 @@ class TaskManager:
                 "input_path": input_path,
                 "output_dir": output_dir,
                 "markdown_name": markdown_name,
+                "queue_order": int(timestamp),
                 "total_pages": total_pages,
                 "selected_pages": selected_pages,
                 "status": "queued",
@@ -522,11 +667,49 @@ class TaskManager:
         return task
 
     def retry_task(self, task_id: str) -> Dict[str, Any]:
+        self._cancel_events.pop(task_id, None)
         task = self.store.retry_task(task_id)
         if task is None:
             raise ValueError("任务不存在。")
         self._wake.set()
         return task
+
+    def cancel_task(self, task_id: str) -> Dict[str, Any]:
+        task = self.store.cancel_task(task_id)
+        if task is None:
+            raise ValueError("任务不存在。")
+        if task["status"] in ("running", "cancelling"):
+            self._cancel_events.setdefault(
+                task_id, threading.Event()
+            ).set()
+        return task
+
+    def delete_task(self, task_id: str) -> bool:
+        task = self.get_task(task_id)
+        if task["status"] in ("running", "cancelling"):
+            raise ValueError("请先终止正在运行的任务，再删除。")
+        if not self.store.delete_task(task_id):
+            raise ValueError("任务不存在。")
+        self._cancel_events.pop(task_id, None)
+        for path in (
+            task.get("input_path"),
+            task.get("output_dir"),
+            os.path.join(self.page_root, task_id),
+        ):
+            if not path:
+                continue
+            try:
+                if os.path.isdir(path):
+                    shutil.rmtree(path, ignore_errors=True)
+                elif os.path.isfile(path):
+                    os.remove(path)
+            except OSError as exc:
+                logger.warning(f"Failed to remove task path {path}: {exc}")
+        return True
+
+    def reorder_queued(self, task_ids: List[str]) -> List[Dict[str, Any]]:
+        self.store.reorder_queued(task_ids)
+        return self.list_tasks()
 
     def page_result(self, task_id: str, page_index: int) -> Dict[str, Any]:
         path = self.store.page_result_path(task_id, page_index)
@@ -620,6 +803,8 @@ class TaskManager:
                 logger.error(f"Web task failed: {task['id']}: {exc}")
                 logger.error(traceback.format_exc())
                 self.store.fail_task(task["id"], str(exc))
+            finally:
+                self._cancel_events.pop(task["id"], None)
 
     def _process_task(self, task: Dict[str, Any]) -> bool:
         task_id = task["id"]
@@ -650,10 +835,16 @@ class TaskManager:
                 self.store.remove_page(task_id, page_index)
 
         self._write_markdown(task, page_markdowns)
+        if self._is_cancelled(task_id):
+            self.store.mark_cancelled(task_id)
+            return True
 
         for page_index in task["selected_pages"]:
             if self._stop.is_set():
                 return False
+            if self._is_cancelled(task_id):
+                self.store.mark_cancelled(task_id)
+                return True
             if page_index in completed:
                 continue
 
@@ -680,9 +871,19 @@ class TaskManager:
             completed.add(page_index)
             page_markdowns[page_index] = result.get("markdown", "")
             self._write_markdown(task, page_markdowns)
+            if self._is_cancelled(task_id):
+                self.store.mark_cancelled(task_id)
+                return True
 
+        if self._is_cancelled(task_id):
+            self.store.mark_cancelled(task_id)
+            return True
         self.store.complete_task(task_id)
         return True
+
+    def _is_cancelled(self, task_id: str) -> bool:
+        event = self._cancel_events.get(task_id)
+        return bool(event and event.is_set())
 
     @staticmethod
     def _write_markdown(

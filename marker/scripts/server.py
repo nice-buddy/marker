@@ -145,6 +145,10 @@ class ViewerPrepareParams(BaseModel):
     pages: list[int] = Field(default_factory=list)
 
 
+class TaskReorderParams(BaseModel):
+    task_ids: list[str] = Field(default_factory=list)
+
+
 if _HAS_FASTAPI:
     app = FastAPI(
         title="Marker API & Interactive Viewer",
@@ -279,6 +283,15 @@ if _HAS_FASTAPI:
     async def api_list_tasks():
         return await run_in_threadpool(_get_task_manager().list_tasks)
 
+    @app.post("/api/tasks/reorder")
+    async def api_reorder_tasks(params: TaskReorderParams):
+        try:
+            return await run_in_threadpool(
+                _get_task_manager().reorder_queued, params.task_ids
+            )
+        except ValueError as exc:
+            return JSONResponse(status_code=409, content={"error": str(exc)})
+
     @app.get("/api/tasks/{task_id}")
     async def api_get_task(task_id: str):
         try:
@@ -349,6 +362,25 @@ if _HAS_FASTAPI:
             )
         except ValueError as exc:
             return JSONResponse(status_code=404, content={"error": str(exc)})
+
+    @app.post("/api/tasks/{task_id}/cancel")
+    async def api_cancel_task(task_id: str):
+        try:
+            return await run_in_threadpool(
+                _get_task_manager().cancel_task, task_id
+            )
+        except ValueError as exc:
+            return JSONResponse(status_code=404, content={"error": str(exc)})
+
+    @app.delete("/api/tasks/{task_id}")
+    async def api_delete_task(task_id: str):
+        try:
+            await run_in_threadpool(
+                _get_task_manager().delete_task, task_id
+            )
+            return {"success": True}
+        except ValueError as exc:
+            return JSONResponse(status_code=409, content={"error": str(exc)})
 else:
     app = None
 
