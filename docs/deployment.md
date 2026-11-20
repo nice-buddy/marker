@@ -774,7 +774,49 @@ $env:LLAMA_CPP_BINARY = "C:\Apps\llama.cpp\llama-server.exe"
 
 不要在 Windows 原生环境依赖自动检测去启动 Docker vLLM。需要使用 vLLM 时，建议在 WSL2/Ubuntu 中部署。
 
-### 12.4 Ubuntu vLLM 启动失败
+### 12.4 Windows 报 `module 'os' has no attribute 'WNOHANG'`
+
+这是 Surya 0.24 的 llama.cpp 进程存活检查使用了 POSIX 的 `os.waitpid(..., os.WNOHANG)`。当前 Marker 代码已经包含 Windows 兼容层：
+
+```text
+marker/utils/surya_compat.py
+```
+
+它会在 Windows 上用 `psutil` 判断和停止 llama-server，不再调用 `os.waitpid`、`os.WNOHANG` 或 `os.kill(pid, 0)`。
+
+更新到最新提交后重新安装并重启：
+
+```powershell
+cd C:\App\AI\marker
+git pull
+.\.venv\Scripts\Activate.ps1
+uv pip install -e ".[full]" "httpx[socks]" "httpcore[socks]" uvicorn fastapi python-multipart
+marker_gui --host 0.0.0.0 --port 7861 --mode vllm
+```
+
+如果 Windows 上不是 Git 工作副本，需要至少把以下两个文件同步过去：
+
+```text
+marker/models.py
+marker/utils/surya_compat.py
+```
+
+然后重启 `marker_gui`。确认当前代码包含兼容层：
+
+```powershell
+Select-String -Path .\marker\models.py -Pattern "apply_surya_windows_compat"
+Test-Path .\marker\utils\surya_compat.py
+```
+
+也可以运行 Windows 专用兼容性测试：
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q tests\utils\test_surya_compat.py
+```
+
+在 Windows 上应看到 `2 passed`。
+
+### 12.5 Ubuntu vLLM 启动失败
 
 依次检查：
 
@@ -791,7 +833,7 @@ echo "$VLLM_GPU_TYPE"
 - 未安装 NVIDIA Container Toolkit。
 - `VLLM_GPU_TYPE` 与实际 GPU 不匹配。
 
-### 12.5 输出目录不在应用目录下
+### 12.6 输出目录不在应用目录下
 
 默认输出目录由 `.venv` 位置决定。确认：
 
@@ -806,7 +848,7 @@ python -c "from marker.settings import settings; print(settings.OUTPUT_DIR)"
 marker_single input.pdf --output_dir /path/to/marker-md/outputs
 ```
 
-### 12.6 WebUI 无法访问
+### 12.7 WebUI 无法访问
 
 检查：
 
@@ -815,14 +857,14 @@ marker_single input.pdf --output_dir /path/to/marker-md/outputs
 - 端口是否被占用。
 - 是否访问了正确的主机 IP。
 
-### 12.7 `weasyprint` / GTK / Pango 报错
+### 12.8 `weasyprint` / GTK / Pango 报错
 
 只处理 PDF 时使用不带 `[full]` 的安装命令。需要 Office/HTML/EPUB 时：
 
 - Ubuntu：安装 `libpango-1.0-0`、`libpangoft2-1.0-0`、`libgdk-pixbuf-2.0-0`。
 - Windows：安装 GTK3 运行库并加入 PATH，或改用 WSL2/Ubuntu。
 
-### 12.8 日志出现 `Layout inference failed ... full-page OCR will rebuild it`
+### 12.9 日志出现 `Layout inference failed ... full-page OCR will rebuild it`
 
 这表示该页的 layout 输出解析失败，但整页 OCR 会继续重建文本。该页的图片块可能无法提取。可以：
 
@@ -831,7 +873,7 @@ marker_single input.pdf --output_dir /path/to/marker-md/outputs
 - 对图片要求高的任务使用 `--mode vllm`。
 - 如果频繁出现，尝试把 PDF 拆分后转换。
 
-### 12.9 ZIP 中没有图片
+### 12.10 ZIP 中没有图片
 
 依次检查：
 

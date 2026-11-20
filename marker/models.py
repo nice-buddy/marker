@@ -6,6 +6,9 @@ from surya.inference import SuryaInferenceManager
 from surya.recognition import RecognitionPredictor
 
 from marker.ocr import IndraRecognitionPredictor
+from marker.utils.surya_compat import apply_surya_windows_compat
+
+apply_surya_windows_compat()
 
 
 def _ensure_surya_cache_writable() -> None:
