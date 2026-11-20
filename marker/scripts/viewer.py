@@ -799,18 +799,18 @@ main{padding:24px;display:flex;flex-direction:column;gap:24px;min-width:0}
 .chip.error{background:oklch(95% .05 25);color:var(--err)}
 .meta{font:12px var(--font-mono);color:var(--ink-3)}.ch .sp{flex:1}
 .tbar{display:flex;height:6px;border-radius:3px;overflow:hidden;background:var(--surface-2);width:170px}.tbar i{display:block;height:100%}
-.body{display:grid;grid-template-columns:minmax(0,1.05fr) minmax(0,1fr);min-height:440px}
-@media(max-width:1200px){.body{grid-template-columns:1fr}}
+.body{display:grid;grid-template-columns:minmax(0,1.05fr) minmax(0,1fr);min-height:440px;align-items:start}
+@media(max-width:1200px){.body{grid-template-columns:1fr}.pane{max-height:70vh}}
 .pageview{padding:16px;background:var(--surface);border-right:var(--hairline) solid var(--rule)}
 svg.pg{width:100%;height:auto;display:block;background:#fff;box-shadow:0 1px 2px oklch(18% .012 263 / .08),0 0 0 var(--hairline) var(--rule)}
-.right{display:flex;flex-direction:column;min-width:0}
+.right{display:flex;flex-direction:column;min-width:0;min-height:0;overflow:hidden}
 .tabs{display:flex;align-items:center;gap:2px;padding:8px 12px 0;border-bottom:var(--hairline) solid var(--rule);overflow-x:auto}
 .tabs button{border:0;background:transparent;padding:8px 10px;font:500 12.5px var(--font-body);color:var(--ink-3);cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px;white-space:nowrap}
 .tabs button.on{color:var(--ink);border-bottom-color:var(--accent)}
 .tabs .sp{flex:1}
 .tabs .copy-btn{font:500 11px var(--font-mono);padding:4px 8px;margin-bottom:4px;border:var(--hairline) solid var(--rule);border-radius:5px;background:var(--surface);color:var(--ink-2)}
 .tabs .copy-btn:hover{background:var(--surface-2)}
-.pane{flex:1;overflow:auto;max-height:78vh;padding:14px 16px}
+.pane{flex:1 1 auto;min-height:0;overflow:auto;padding:14px 16px}
 .pane.src{white-space:pre-wrap;font:12.5px/1.6 var(--font-mono);color:var(--ink-2)}
 .preview{font-size:14px;line-height:1.6}
 .preview h1,.preview h2,.preview h3,.preview h4{letter-spacing:-.015em;line-height:1.25;margin:1em 0 .4em}
@@ -950,6 +950,23 @@ const HINT={
  vllm:"Full-page Surya 2.5 VLM OCR on every page, skipping pdftext and Indra entirely."
 };
 let mode="auto",doc=null,stats=[],pagesMd=[],runId=0,timerId=null,runAbort=null;
+function syncRightHeight(card){
+ const page=card.querySelector('.pageview'),right=card.querySelector('.right');
+ if(!page||!right)return;
+ if(window.matchMedia('(max-width:1200px)').matches){right.style.height='';return}
+ right.style.height=Math.round(page.getBoundingClientRect().height)+'px';
+}
+const cardSizeObserver=('ResizeObserver' in window)?new ResizeObserver(entries=>{
+ for(const entry of entries){const card=entry.target.closest('.card');if(card)syncRightHeight(card)}
+}):null;
+function observeCardSize(card){
+ const page=card.querySelector('.pageview');
+ if(!page)return;
+ if(cardSizeObserver)cardSizeObserver.observe(page);
+ syncRightHeight(card);
+ requestAnimationFrame(()=>syncRightHeight(card));
+}
+window.addEventListener('resize',()=>$$('.card').forEach(syncRightHeight));
 function setMode(v){mode=v;$$('#mode button').forEach(b=>b.classList.toggle('on',b.dataset.v===v));$('#modehint').textContent=HINT[v]||''}
 $$('#mode button').forEach(b=>b.onclick=()=>{setMode(b.dataset.v);if(doc)run();});
 $('#legend').innerHTML=LEGEND_ITEMS.map(([k,c])=>`<span style="white-space:nowrap;margin-right:8px"><span class="dot" style="background:${c}"></span>${k}</span>`).join(' ');
@@ -1055,6 +1072,7 @@ async function run(){
  const pageList=parsePageIndices($('#prange').value,doc.pages,maxP);
  if(!pageList.length){setBanner('err','No valid pages in range (0..'+(doc.pages-1)+')','',100,false);return;}
  $('#out').innerHTML='';stats=[];pagesMd=[];$('#dl-md').hidden=true;summary();
+ if(cardSizeObserver)cardSizeObserver.disconnect();
  try{
   const pr=await fetch('/prepare',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:doc.id,pages:pageList}),signal:ctrl.signal});
   const pres=await pr.json();
@@ -1185,6 +1203,7 @@ function render(p,beforeEl){
  });
  if(beforeEl&&beforeEl.parentNode===$('#out'))$('#out').insertBefore(c,beforeEl);
  else $('#out').appendChild(c);
+ observeCardSize(c);
 }
 </script></body></html>"""
 
