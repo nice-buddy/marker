@@ -195,9 +195,9 @@ class ViewerEngine:
 
     def upload(self, data: bytes, filename: str = "document.pdf") -> Dict[str, Any]:
         if not data:
-            raise ValueError("Uploaded file is empty.")
+            raise ValueError("上传文件为空。")
         if len(data) > self.max_upload_bytes:
-            raise ValueError("Uploaded file exceeds maximum allowed size.")
+            raise ValueError("上传文件超过大小限制。")
 
         raw_name = os.path.basename(filename or "document.pdf")
         ext = os.path.splitext(raw_name)[1].lower()
@@ -207,7 +207,7 @@ class ViewerEngine:
             else:
                 ext = ".png"
         if ext not in ALLOWED_EXTENSIONS:
-            raise ValueError(f"Unsupported file type: {ext}")
+            raise ValueError(f"不支持的文件类型：{ext}")
 
         did = uuid.uuid4().hex[:12]
         filepath = os.path.join(self.tmp.name, f"{did}{ext}")
@@ -233,7 +233,7 @@ class ViewerEngine:
                 os.remove(filepath)
             except OSError:
                 pass
-            raise ValueError(f"Could not read document: {exc}") from exc
+            raise ValueError(f"无法读取文档：{exc}") from exc
 
         stem = os.path.splitext(raw_name)[0]
         if not stem or stem in (".", ".."):
@@ -271,7 +271,7 @@ class ViewerEngine:
         with self.docs_lock:
             doc_info = self.docs.get(did)
         if doc_info is None:
-            raise ValueError("Document not found — please upload the file again.")
+            raise ValueError("文档不存在，请重新上传。")
 
         out_folder = doc_info["out_folder"]
         if os.path.isdir(out_folder):
@@ -288,15 +288,53 @@ class ViewerEngine:
         with self.docs_lock:
             doc_info = self.docs.get(did)
         if doc_info is None:
-            raise ValueError("Document not found — please drop or select the file again.")
-        filepath = doc_info["path"]
-        total_pages = doc_info["pages"]
+            raise ValueError("文档不存在，请重新上传或选择文件。")
+        result = self.convert_page(
+            filepath=doc_info["path"],
+            total_pages=doc_info["pages"],
+            n=n,
+            opts=opts,
+            images_folder=doc_info["images_folder"],
+        )
+        with self.docs_lock:
+            doc_info["saved_pages"][n] = result["markdown"]
+            page_order = doc_info["page_order"] or sorted(
+                doc_info["saved_pages"]
+            )
+            combined_markdown = "\n\n---\n\n".join(
+                doc_info["saved_pages"][p]
+                for p in page_order
+                if p in doc_info["saved_pages"]
+            )
+            os.makedirs(doc_info["out_folder"], exist_ok=True)
+            markdown_path = os.path.join(
+                doc_info["out_folder"], f"{doc_info['stem']}.md"
+            )
+            with open(
+                markdown_path, "w", encoding=settings.OUTPUT_ENCODING
+            ) as markdown_file:
+                markdown_file.write(combined_markdown)
+        return result
+
+    def convert_page(
+        self,
+        filepath: str,
+        total_pages: int,
+        n: int,
+        opts: Optional[Dict[str, Any]] = None,
+        images_folder: Optional[str] = None,
+        display_image_path: Optional[str] = None,
+        display_image_url: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        opts = opts or {}
         if n < 0 or n >= total_pages:
-            raise ValueError(f"Page index {n} out of range (0..{total_pages - 1}).")
+            raise ValueError(f"页码超出范围（0..{total_pages - 1}）。")
+        if not images_folder:
+            raise ValueError("images_folder is required")
 
         mode = str(opts.get("mode") or "auto").lower()
         if mode not in MODES:
-            raise ValueError(f"mode must be one of {MODES}")
+            raise ValueError(f"模式必须是以下之一：{MODES}")
 
         force_ocr = bool(opts.get("force_ocr", False))
         use_llm = bool(opts.get("use_llm", False))
@@ -385,32 +423,12 @@ class ViewerEngine:
                 markdown_str, (extracted_images or {}).keys(), "md"
             )
 
-            images_folder = doc_info["images_folder"]
             os.makedirs(images_folder, exist_ok=True)
             for img_name, pil_im in (extracted_images or {}).items():
                 pil_im.convert("RGB").save(
                     os.path.join(images_folder, img_name),
                     format=settings.OUTPUT_IMAGE_FORMAT,
                 )
-
-            with self.docs_lock:
-                doc_info["saved_pages"][n] = markdown_str
-                page_order = doc_info["page_order"] or sorted(
-                    doc_info["saved_pages"]
-                )
-                combined_markdown = "\n\n---\n\n".join(
-                    doc_info["saved_pages"][p]
-                    for p in page_order
-                    if p in doc_info["saved_pages"]
-                )
-                os.makedirs(doc_info["out_folder"], exist_ok=True)
-                markdown_path = os.path.join(
-                    doc_info["out_folder"], f"{doc_info['stem']}.md"
-                )
-                with open(
-                    markdown_path, "w", encoding=settings.OUTPUT_ENCODING
-                ) as markdown_file:
-                    markdown_file.write(combined_markdown)
 
             img_fmt = settings.OUTPUT_IMAGE_FORMAT.lower()
             encoded_images: Dict[str, str] = {}
@@ -455,9 +473,14 @@ class ViewerEngine:
 
             jpg_buf = io.BytesIO()
             display_img.save(jpg_buf, format="JPEG", quality=84)
-            img_data_url = "data:image/jpeg;base64," + base64.b64encode(
-                jpg_buf.getvalue()
-            ).decode("ascii")
+            if display_image_path:
+                os.makedirs(os.path.dirname(display_image_path), exist_ok=True)
+                with open(display_image_path, "wb") as image_file:
+                    image_file.write(jpg_buf.getvalue())
+            img_value = display_image_url or (
+                "data:image/jpeg;base64,"
+                + base64.b64encode(jpg_buf.getvalue()).decode("ascii")
+            )
 
             page_obj = document.pages[0]
             page_size = (
@@ -581,7 +604,7 @@ class ViewerEngine:
                 "page_index": n,
                 "w": disp_w,
                 "h": disp_h,
-                "img": img_data_url,
+                "img": img_value,
                 "source": source_chip,
                 "mode_used": resolved_mode,
                 "blocks": blocks_out,
@@ -599,13 +622,13 @@ class ViewerEngine:
         with self.docs_lock:
             doc_info = self.docs.get(did)
         if doc_info is None:
-            raise ValueError("Document not found — please upload the file again.")
+            raise ValueError("文档不存在，请重新上传。")
 
         out_folder = doc_info["out_folder"]
         stem = doc_info["stem"]
         markdown_path = os.path.join(out_folder, f"{stem}.md")
         if not os.path.isfile(markdown_path):
-            raise ValueError("No converted output is available to download yet.")
+            raise ValueError("暂无可下载的转换结果。")
 
         archive = io.BytesIO()
         with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -635,6 +658,19 @@ def render_viewer_html() -> str:
 def make_handler(engine: ViewerEngine):
     """Standard library HTTP handler for running the viewer without FastAPI/uvicorn."""
 
+    manager_ref: Dict[str, Any] = {}
+
+    def get_task_manager():
+        if "manager" not in manager_ref:
+            from marker.scripts.web_tasks import TaskManager
+
+            manager_ref["manager"] = TaskManager(engine)
+            manager_ref["manager"].start()
+        return manager_ref["manager"]
+
+    def query_bool(params, name: str) -> bool:
+        return str(params.get(name, "")).lower() in {"1", "true", "yes", "on"}
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
             pass
@@ -658,6 +694,104 @@ def make_handler(engine: ViewerEngine):
                 )
             elif parsed.path == "/info":
                 self._send(200, json.dumps(engine.info(has_api_docs=False)).encode("utf-8"))
+            elif parsed.path == "/api/tasks":
+                self._send(
+                    200,
+                    json.dumps(
+                        get_task_manager().list_tasks(), ensure_ascii=False
+                    ).encode("utf-8"),
+                )
+            elif match := re.fullmatch(
+                r"/api/tasks/([^/]+)/pages", parsed.path
+            ):
+                query = urllib.parse.parse_qs(parsed.query)
+                page = int(query.get("page", ["1"])[0])
+                page_size = int(query.get("page_size", ["10"])[0])
+                try:
+                    result = get_task_manager().page_window(
+                        match.group(1), page, page_size
+                    )
+                    self._send(
+                        200,
+                        json.dumps(result, ensure_ascii=False).encode("utf-8"),
+                    )
+                except ValueError as exc:
+                    self._send(
+                        404,
+                        json.dumps(
+                            {"error": str(exc)}, ensure_ascii=False
+                        ).encode("utf-8"),
+                    )
+            elif match := re.fullmatch(
+                r"/api/tasks/([^/]+)/pages/(\d+)/image", parsed.path
+            ):
+                image_path = get_task_manager().page_image_path(
+                    match.group(1), int(match.group(2))
+                )
+                if not os.path.isfile(image_path):
+                    return self._send(
+                        404,
+                        json.dumps(
+                            {"error": "页面图片不存在。"},
+                            ensure_ascii=False,
+                        ).encode("utf-8"),
+                    )
+                with open(image_path, "rb") as f:
+                    self._send(200, f.read(), "image/jpeg")
+            elif match := re.fullmatch(
+                r"/api/tasks/([^/]+)/pages/(\d+)", parsed.path
+            ):
+                try:
+                    result = get_task_manager().page_result(
+                        match.group(1), int(match.group(2))
+                    )
+                    self._send(
+                        200,
+                        json.dumps(result, ensure_ascii=False).encode("utf-8"),
+                    )
+                except ValueError as exc:
+                    self._send(
+                        404,
+                        json.dumps(
+                            {"error": str(exc)}, ensure_ascii=False
+                        ).encode("utf-8"),
+                    )
+            elif match := re.fullmatch(
+                r"/api/tasks/([^/]+)/download", parsed.path
+            ):
+                try:
+                    data, filename = get_task_manager().download_zip(
+                        match.group(1)
+                    )
+                except ValueError as exc:
+                    return self._send(
+                        404,
+                        json.dumps(
+                            {"error": str(exc)}, ensure_ascii=False
+                        ).encode("utf-8"),
+                    )
+                self._response_headers = {
+                    "Content-Disposition": (
+                        "attachment; filename*=UTF-8''"
+                        + urllib.parse.quote(filename)
+                    )
+                }
+                self._send(200, data, "application/zip")
+                self._response_headers = {}
+            elif match := re.fullmatch(r"/api/tasks/([^/]+)", parsed.path):
+                try:
+                    result = get_task_manager().get_task(match.group(1))
+                    self._send(
+                        200,
+                        json.dumps(result, ensure_ascii=False).encode("utf-8"),
+                    )
+                except ValueError as exc:
+                    self._send(
+                        404,
+                        json.dumps(
+                            {"error": str(exc)}, ensure_ascii=False
+                        ).encode("utf-8"),
+                    )
             elif parsed.path == "/download":
                 did = urllib.parse.parse_qs(parsed.query).get("id", [""])[0]
                 try:
@@ -681,7 +815,42 @@ def make_handler(engine: ViewerEngine):
             length = int(self.headers.get("Content-Length", "0"))
             body = self.rfile.read(length)
             try:
-                if self.path == "/upload":
+                parsed = urllib.parse.urlparse(self.path)
+                if parsed.path == "/api/tasks":
+                    filename = urllib.parse.unquote(
+                        self.headers.get("X-Filename", "document.pdf")
+                    )
+                    if len(body) > engine.max_upload_bytes:
+                        return self._send(
+                            413,
+                            json.dumps(
+                                {"error": "上传文件超过大小限制。"},
+                                ensure_ascii=False,
+                            ).encode("utf-8"),
+                        )
+                    query = urllib.parse.parse_qs(parsed.query)
+                    options = {
+                        "mode": query.get("mode", ["auto"])[0],
+                        "dpi": int(query.get("dpi", ["300"])[0]),
+                        "max_pages": int(query.get("max_pages", ["1000"])[0]),
+                        "page_range": query.get("page_range", [""])[0],
+                        "force_ocr": query_bool(query, "force_ocr"),
+                        "use_llm": query_bool(query, "use_llm"),
+                        "strip_existing_ocr": query_bool(
+                            query, "strip_existing_ocr"
+                        ),
+                        "keep_headers_footers": query_bool(
+                            query, "keep_headers_footers"
+                        ),
+                    }
+                    res = get_task_manager().create_task(
+                        body, filename, options
+                    )
+                elif match := re.fullmatch(
+                    r"/api/tasks/([^/]+)/retry", parsed.path
+                ):
+                    res = get_task_manager().retry_task(match.group(1))
+                elif self.path == "/upload":
                     fname = urllib.parse.unquote(
                         self.headers.get("X-Filename", "document.pdf")
                     )
@@ -694,17 +863,22 @@ def make_handler(engine: ViewerEngine):
                     res = engine.prepare(q["id"], q.get("pages", []))
                 else:
                     return self._send(404, b"not found", "text/plain")
-                self._send(200, json.dumps(res).encode("utf-8"))
+                self._send(200, json.dumps(res, ensure_ascii=False).encode("utf-8"))
             except Exception as exc:
                 logger.warning(f"Viewer request error: {exc}")
-                self._send(400, json.dumps({"error": str(exc)}).encode("utf-8"))
+                self._send(
+                    400,
+                    json.dumps(
+                        {"error": str(exc)}, ensure_ascii=False
+                    ).encode("utf-8"),
+                )
 
     return Handler
 
 
 PAGE = r"""<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Marker Viewer · Datalab</title>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Marker 文档转换器 · Datalab</title>
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
@@ -756,7 +930,7 @@ main{padding:24px;display:flex;flex-direction:column;gap:24px;min-width:0}
 .btn{border:0;background:var(--accent);color:var(--accent-ink);font:500 13px var(--font-body);padding:9px 12px;border-radius:7px;cursor:pointer;text-align:center}
 .btn:hover{background:var(--accent-strong)}.btn:disabled{background:var(--rule-strong);cursor:default}
 .btn-sec{border:var(--hairline) solid var(--rule-strong);background:#fff;color:var(--ink-2);font:500 12px var(--font-body);padding:6px 10px;border-radius:6px;cursor:pointer}
-.btn-sec:hover{background:var(--surface)}
+.btn-sec:hover{background:var(--surface)}.btn-sec:disabled{opacity:.45;cursor:default}
 .dot{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:5px;vertical-align:0}
 #stats{font:12px/1.7 var(--font-mono);color:var(--ink-2)}#stats b{color:var(--ink);font-weight:500}
 #status{font:500 12px var(--font-mono);color:var(--ink-2);min-height:18px;font-variant-numeric:tabular-nums}
@@ -840,70 +1014,89 @@ circle.on-n{fill:oklch(60% .2 30);pointer-events:none}
 text.n{font-family:var(--font-mono);font-weight:600;fill:#fff;text-anchor:middle;dominant-baseline:central;pointer-events:none}
 .hide-lines rect.ln,.hide-blocks rect.bk,.hide-blocks text.bl,.hide-labels text.bl,.hide-order .ord,.hide-order circle.on-n,.hide-order text.n{display:none}
 footer{padding:18px 24px;border-top:var(--hairline) solid var(--rule);display:flex;justify-content:space-between;flex-wrap:wrap;gap:10px;font-size:12px;color:var(--ink-3)}
+.history{display:flex;flex-direction:column;gap:6px;max-height:240px;overflow:auto}
+.hist-item{border:var(--hairline) solid var(--rule);background:#fff;border-radius:7px;padding:8px 9px;text-align:left;cursor:pointer;font:12px var(--font-body);color:var(--ink-2)}
+.hist-item:hover{background:var(--surface)}
+.hist-item.active{border-color:var(--accent);background:var(--accent-soft)}
+.hist-name{display:block;font-weight:600;color:var(--ink);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.hist-meta{display:block;margin-top:3px;font:11px var(--font-mono);color:var(--ink-3)}
+.pager{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.pager .sp{flex:1}
 </style></head><body>
 <div class="top">
  <div class="brand"><img class="mark" src="data:image/png;base64,__LOGO__" alt="Datalab">Datalab<span class="sep">/</span><span class="prod">Marker</span></div>
  <span class="ver" id="ver"></span><span class="ver" id="dev" hidden></span>
  <div class="sp"></div>
- <nav><a href="/docs" id="apidocs" target="_blank" rel="noopener" hidden>API Docs</a><a href="https://github.com/datalab-to/marker" target="_blank" rel="noopener">GitHub</a><a href="https://documentation.datalab.to" target="_blank" rel="noopener">Docs</a><a class="cta" href="https://www.datalab.to/?utm_source=marker-viewer" target="_blank" rel="noopener">Try Chandra on Datalab</a></nav>
+ <nav><a href="/docs" id="apidocs" target="_blank" rel="noopener" hidden>API 文档</a><a href="https://github.com/datalab-to/marker" target="_blank" rel="noopener">GitHub</a><a href="https://documentation.datalab.to" target="_blank" rel="noopener">文档</a><a class="cta" href="https://www.datalab.to/?utm_source=marker-viewer" target="_blank" rel="noopener">试用 Datalab Chandra</a></nav>
 </div>
 <div class="wrap">
 <aside>
  <div>
-  <div id="drop"><b>Drop a PDF, image, or document</b><span>PDF, PNG, JPG, DOCX, PPTX, XLSX, HTML, EPUB</span><input id="file" type="file" accept=".pdf,.png,.jpg,.jpeg,.gif,.webp,.tiff,.tif,.bmp,.pptx,.docx,.xlsx,.html,.htm,.epub" hidden></div>
+  <div id="drop"><b>拖放 PDF、图片或文档</b><span>PDF、PNG、JPG、DOCX、PPTX、XLSX、HTML、EPUB</span><input id="file" type="file" accept=".pdf,.png,.jpg,.jpeg,.gif,.webp,.tiff,.tif,.bmp,.pptx,.docx,.xlsx,.html,.htm,.epub" hidden></div>
   <div id="fname"></div>
  </div>
- <div class="group"><div class="label">Mode</div>
+ <div class="group"><div class="label">历史记录</div>
+  <div id="history" class="history"><div class="hint">暂无转换记录</div></div>
+ </div>
+ <div class="group"><div class="label">转换模式</div>
   <div class="seg" id="mode">
-   <button data-v="auto">Auto</button>
-   <button data-v="no_ocr">No OCR</button>
-   <button data-v="fast">Fast</button>
-   <button data-v="balanced">Balanced</button>
+   <button data-v="auto">自动</button>
+   <button data-v="no_ocr">无 OCR</button>
+   <button data-v="fast">快速</button>
+   <button data-v="balanced">均衡</button>
    <button data-v="vllm">vLLM</button>
   </div>
   <div class="hint" id="modehint"></div>
  </div>
- <div class="group"><div class="label">Pipeline</div>
-  <label class="sw">Force OCR<input type="checkbox" id="force_ocr"></label>
-  <label class="sw">Use LLM (hybrid)<input type="checkbox" id="use_llm"></label>
-  <label class="sw">Strip existing OCR<input type="checkbox" id="strip_ocr"></label>
-  <label class="sw">Keep headers and footers<input type="checkbox" id="furniture"></label>
+ <div class="group"><div class="label">处理选项</div>
+  <label class="sw">强制 OCR<input type="checkbox" id="force_ocr"></label>
+  <label class="sw">使用 LLM（混合）<input type="checkbox" id="use_llm"></label>
+  <label class="sw">清除已有 OCR<input type="checkbox" id="strip_ocr"></label>
+  <label class="sw">保留页眉页脚<input type="checkbox" id="furniture"></label>
   <div class="row2">
    <div class="field"><span class="label">DPI</span><select id="dpi"><option>150</option><option>200</option><option selected>300</option></select></div>
-   <div class="field"><span class="label">Max pages</span><input id="maxp" type="number" min="1" value="1000"></div>
+   <div class="field"><span class="label">最大页数</span><input id="maxp" type="number" min="1" value="1000"></div>
   </div>
-  <div class="field"><span class="label">Page range (0-indexed)</span><input id="prange" type="text" placeholder="All (or e.g. 0,2-5)"></div>
-  <button class="btn" id="rerun" disabled>Convert again with these options</button>
+  <div class="field"><span class="label">页码范围（从 0 开始）</span><input id="prange" type="text" placeholder="全部（或例如 0,2-5）"></div>
+  <div class="hint">上传后按当前设置加入队列；已有任务不会被修改。</div>
+  <button class="btn" id="rerun" hidden>重试当前任务</button>
  </div>
- <div class="group"><div class="label">Show</div>
-  <label class="sw">Layout blocks<input type="checkbox" class="disp" data-c="blocks" checked></label>
-  <label class="sw">Block labels<input type="checkbox" class="disp" data-c="labels" checked></label>
-  <label class="sw">Reading order<input type="checkbox" class="disp" data-c="order" checked></label>
-  <label class="sw">Lines<input type="checkbox" class="disp" data-c="lines"></label>
+ <div class="group"><div class="label">显示</div>
+  <label class="sw">版面区块<input type="checkbox" class="disp" data-c="blocks" checked></label>
+  <label class="sw">区块标签<input type="checkbox" class="disp" data-c="labels" checked></label>
+  <label class="sw">阅读顺序<input type="checkbox" class="disp" data-c="order" checked></label>
+  <label class="sw">文本行<input type="checkbox" class="disp" data-c="lines"></label>
   <div id="legend" class="hint"></div>
  </div>
- <div class="group"><div class="label">Run</div>
+ <div class="group"><div class="label">状态</div>
   <div id="status"></div>
   <div id="stats"></div>
-  <button class="btn-sec" id="dl-md" hidden>Download Markdown (.zip)</button>
+  <button class="btn-sec" id="dl-md" hidden>下载 Markdown（.zip）</button>
  </div>
- <div class="callout">Need handwriting, complex forms, and highest-accuracy VLM parsing at scale? <a href="https://www.datalab.to/?utm_source=marker-viewer" target="_blank" rel="noopener">Chandra on Datalab</a> includes 5,000 free pages/month with a work email.</div>
+ <div class="callout">需要更高精度的手写、复杂表单和 VLM 解析？可使用 <a href="https://www.datalab.to/?utm_source=marker-viewer" target="_blank" rel="noopener">Datalab Chandra</a>。</div>
 </aside>
 <main>
  <div class="pbanner" id="pbanner" hidden>
   <div class="prow">
    <div class="spin" id="pspin"></div>
    <div class="pbadge" id="pbadge" hidden>✓</div>
-   <div class="ptitle" id="ptitle">Converting document…</div>
-   <div class="psub" id="psub">0 / 0 pages · 0.0s</div>
-   <button class="btn-sec" id="pbanner-dl" hidden>Download .zip</button>
+   <div class="ptitle" id="ptitle">正在转换文档…</div>
+   <div class="psub" id="psub">0 / 0 页</div>
+   <button class="btn-sec" id="pbanner-dl" hidden>下载 .zip</button>
   </div>
   <div class="ptrack"><div class="pfill indet" id="pfill" style="width:0%"></div></div>
  </div>
- <div id="out" style="display:flex;flex-direction:column;gap:24px"><div class="empty"><h2>Convert a document</h2>Drop a PDF, image, or Office document on the left. Pages appear as they finish with interactive layout blocks, reading order, lines, Markdown, HTML, Chunks, and JSON.</div></div>
+ <div class="pager" id="pager" hidden>
+  <button class="btn-sec" id="prev-page">上一页</button>
+  <span id="page-info" class="mono"></span>
+  <button class="btn-sec" id="next-page">下一页</button>
+  <span class="sp"></span>
+  <span id="page-summary" class="hint"></span>
+ </div>
+ <div id="out" style="display:flex;flex-direction:column;gap:24px"><div class="empty"><h2>转换文档</h2>拖放 PDF、图片或 Office 文档。转换结果会按页分页展示，历史任务可随时恢复。</div></div>
 </main>
 </div>
-<footer><span>Marker · high-speed document conversion by <a href="https://www.datalab.to" target="_blank" rel="noopener">Datalab</a></span><span class="mono">Runs locally: your files stay on this machine.</span></footer>
+<footer><span>Marker · <a href="https://www.datalab.to" target="_blank" rel="noopener">Datalab</a> 高速文档转换</span><span class="mono">本地运行：文件不会离开这台机器。</span></footer>
 <script>
 const $=s=>document.querySelector(s),$$=s=>[...document.querySelectorAll(s)];
 const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'})[c]);
@@ -926,30 +1119,42 @@ const BLOCK={
  "PageHeader":"oklch(68% .03 263)",
  "PageFooter":"oklch(68% .03 263)"
 };
+const BLOCK_NAMES={
+ "Text":"文本","TextInlineMath":"行内公式文本","SectionHeader":"章节标题",
+ "ListItem":"列表项","Table":"表格","Form":"表单","TableOfContents":"目录",
+ "Equation":"公式","Picture":"图片","Figure":"插图","Diagram":"图表",
+ "Caption":"图注","Footnote":"脚注","Code":"代码","Blockquote":"引用",
+ "PageHeader":"页眉","PageFooter":"页脚"
+};
+const blockName=label=>BLOCK_NAMES[label]||label;
+const MODE_NAMES={auto:"自动",no_ocr:"无 OCR",fast:"快速",balanced:"均衡",vllm:"vLLM",surya:"Surya",accurate:"高精度",indra:"Indra"};
+const SOURCE_NAMES={pdftext:"文本层",surya:"Surya VLM",indra:"Indra"};
 const LEGEND_ITEMS=[
- ["Text","oklch(55% .02 263)"],
- ["SectionHeader","oklch(45% .22 263)"],
- ["ListItem","oklch(58% .15 145)"],
- ["Table","oklch(55% .18 320)"],
- ["Equation","oklch(52% .22 300)"],
- ["Picture/Figure","oklch(60% .15 160)"],
- ["Caption/Footnote","oklch(62% .14 200)"],
- ["Header/Footer","oklch(68% .03 263)"]
+ ["文本","oklch(55% .02 263)"],
+ ["章节标题","oklch(45% .22 263)"],
+ ["列表项","oklch(58% .15 145)"],
+ ["表格","oklch(55% .18 320)"],
+ ["公式","oklch(52% .22 300)"],
+ ["图片/插图","oklch(60% .15 160)"],
+ ["图注/脚注","oklch(62% .14 200)"],
+ ["页眉/页脚","oklch(68% .03 263)"]
 ];
 const STAGES=[
- ["layout_ms","Layout","oklch(45% .22 263)"],
+ ["layout_ms","版面","oklch(45% .22 263)"],
  ["ocr_ms","OCR","oklch(58% .15 145)"],
- ["postprocess_ms","Processors","oklch(68% .15 75)"],
- ["render_ms","Render","oklch(55% .18 320)"]
+ ["postprocess_ms","后处理","oklch(68% .15 75)"],
+ ["render_ms","渲染","oklch(55% .18 320)"]
 ];
 const HINT={
- auto:"Picks by device: Balanced on GPU (CUDA), Fast on CPU / Apple Silicon.",
- no_ocr:"Pure PDF text layer + Indra ONNX layout on CPU. Zero OCR calls (~24–33 pg/s).",
- fast:"In-process Indra ONNX layout, reading order, and ONNX OCR on CPU (~7–33 pg/s).",
- balanced:"Smart routing: pdftext + Indra on clean prose; Surya 2.5 VLM on tables, math, CJK & scans.",
- vllm:"Full-page Surya 2.5 VLM OCR on every page, skipping pdftext and Indra entirely."
+ auto:"按设备自动选择：CUDA GPU 使用均衡模式，CPU / Apple Silicon 使用快速模式。",
+ no_ocr:"仅使用 PDF 文本层和 CPU 上的 Indra ONNX 版面分析，不调用 OCR。",
+ fast:"在 CPU 上运行 Indra ONNX 版面分析、阅读顺序和 OCR，速度较快。",
+ balanced:"混合模式：干净文本页由 CPU 处理，表格、公式、中文和扫描页交给 Surya VLM。",
+ vllm:"每页都执行完整的 Surya 2.5 VLM OCR，准确率优先。"
 };
-let mode="auto",doc=null,stats=[],pagesMd=[],runId=0,timerId=null,runAbort=null;
+let mode="auto",activeTask=null,historyTasks=[],stats=[],pollTimer=null,pollSeq=0;
+let currentPage=1,pageSize=10,windowSeq=0;
+let currentWindowIndices=[],renderedCompleted=new Set();
 function syncRightHeight(card){
  const page=card.querySelector('.pageview'),right=card.querySelector('.right');
  if(!page||!right)return;
@@ -968,7 +1173,7 @@ function observeCardSize(card){
 }
 window.addEventListener('resize',()=>$$('.card').forEach(syncRightHeight));
 function setMode(v){mode=v;$$('#mode button').forEach(b=>b.classList.toggle('on',b.dataset.v===v));$('#modehint').textContent=HINT[v]||''}
-$$('#mode button').forEach(b=>b.onclick=()=>{setMode(b.dataset.v);if(doc)run();});
+$$('#mode button').forEach(b=>b.onclick=()=>setMode(b.dataset.v));
 $('#legend').innerHTML=LEGEND_ITEMS.map(([k,c])=>`<span style="white-space:nowrap;margin-right:8px"><span class="dot" style="background:${c}"></span>${k}</span>`).join(' ');
 function applyDisplay(){const o=$('#out');$$('.disp').forEach(i=>o.classList.toggle('hide-'+i.dataset.c,!i.checked))}
 $$('.disp').forEach(i=>i.onchange=applyDisplay);applyDisplay();
@@ -977,12 +1182,12 @@ const drop=$('#drop'),file=$('#file');
 drop.onclick=()=>file.click();file.onchange=()=>file.files[0]&&start(file.files[0]);
 drop.ondragover=e=>{e.preventDefault();drop.classList.add('over')};drop.ondragleave=()=>drop.classList.remove('over');
 drop.ondrop=e=>{e.preventDefault();drop.classList.remove('over');e.dataTransfer.files[0]&&start(e.dataTransfer.files[0])};
-$('#rerun').onclick=()=>doc&&run();
+$('#rerun').onclick=retryActiveTask;
 function dlMarkdown(){
- if(!doc)return;
+ if(!activeTask)return;
  const a=document.createElement('a');
- a.href='/download?id='+encodeURIComponent(doc.id);
- a.download=((doc&&doc.name)||'document').replace(/\.[^.]+$/,'')+'.zip';
+ a.href='/api/tasks/'+encodeURIComponent(activeTask.id)+'/download';
+ a.download=(activeTask.task_name||'document')+'.zip';
  document.body.appendChild(a);a.click();a.remove();
 }
 $('#dl-md').onclick=dlMarkdown;
@@ -999,11 +1204,9 @@ function setBanner(state,title,sub,pct,indet){
  $('#psub').textContent=sub||'';
  f.classList.toggle('indet',!!indet);
  f.style.width=Math.max(0,Math.min(100,pct||0))+'%';
- $('#pbanner-dl').hidden=!(state==='done'&&pagesMd.length);
+ $('#pbanner-dl').hidden=!(activeTask&&activeTask.completed_count>0);
  $('#status').textContent=title+(sub?' ('+sub+')':'');
 }
-
-function stopTimer(){if(timerId){clearInterval(timerId);timerId=null;}}
 
 fetch('/info').then(r=>r.json()).then(i=>{
  $('#ver').textContent='v'+(i.version||'2.1.0');
@@ -1017,40 +1220,33 @@ fetch('/info').then(r=>r.json()).then(i=>{
  $('#furniture').checked=!!d.keep_headers_footers;
  if(d.dpi)$('#dpi').value=String(Math.round(d.dpi));
  if(d.max_pages)$('#maxp').value=d.max_pages;
-}).catch(()=>setMode('auto'));
+}).catch(()=>setMode('auto')).finally(()=>loadHistory(true));
 setMode('auto');
 
-function parsePageIndices(spec,total,maxP){
- spec=(spec||'').trim();
- if(!spec){const N=Math.min(total,Math.max(1,maxP));return Array.from({length:N},(_,i)=>i);}
- const out=[],seen=new Set();
- for(const part of spec.split(',')){
-  const s=part.trim();if(!s)continue;
-  if(s.includes('-')){
-   const [aStr,bStr]=s.split('-',2);
-   const a=Math.max(0,parseInt(aStr,10)||0),b=Math.min(total-1,parseInt(bStr,10)||0);
-   for(let p=a;p<=b;p++){if(p>=0&&p<total&&!seen.has(p)){seen.add(p);out.push(p);}}
-  }else{
-   const p=parseInt(s,10);
-   if(!Number.isNaN(p)&&p>=0&&p<total&&!seen.has(p)){seen.add(p);out.push(p);}
-  }
- }
- return out.slice(0,Math.max(1,maxP));
-}
-
-function abortRun(){if(runAbort){try{runAbort.abort();}catch(_){}runAbort=null;}}
-
 async function start(f){
- stopTimer();abortRun();
+ stopPolling();
  $('#fname').textContent=f.name+' · '+(f.size/1024).toFixed(0)+' KB';
- setBanner('run',`Uploading ${f.name}…`,(f.size/1024).toFixed(0)+' KB',100,true);
+ setBanner('run',`正在上传 ${f.name}…`,(f.size/1024).toFixed(0)+' KB',0,true);
  try{
-  const r=await fetch('/upload',{method:'POST',headers:{'X-Filename':encodeURIComponent(f.name)},body:await f.arrayBuffer()});
+  const o=opts();
+  const q=new URLSearchParams({
+   mode:o.mode,
+   dpi:String(o.dpi),
+   max_pages:String(Math.max(1,+$('#maxp').value||1000)),
+   page_range:$('#prange').value||'',
+   force_ocr:String(o.force_ocr),
+   use_llm:String(o.use_llm),
+   strip_existing_ocr:String(o.strip_existing_ocr),
+   keep_headers_footers:String(o.keep_headers_footers)
+  });
+  const r=await fetch('/api/tasks?'+q.toString(),{method:'POST',headers:{'X-Filename':encodeURIComponent(f.name)},body:await f.arrayBuffer()});
   const u=await r.json();
-  if(!r.ok||u.error||u.detail){setBanner('err','Upload error: '+(u.error||u.detail||r.statusText),'',100,false);return}
-  doc={...u,name:f.name};$('#rerun').disabled=false;run();
+  if(!r.ok||u.error||u.detail)throw new Error(u.error||u.detail||r.statusText);
+  activeTask=u;
+  await loadHistory(true);
+  await selectTask(u.id,1);
  }catch(err){
-  setBanner('err','Upload failed: '+(err&&err.message?err.message:String(err)),'',100,false);
+  setBanner('err','上传失败：'+(err&&err.message?err.message:String(err)),'',0,false);
  }
 }
 
@@ -1065,99 +1261,162 @@ function opts(){
  };
 }
 
-async function run(){
- stopTimer();abortRun();
- const id=++runId,ctrl=new AbortController(),o=opts(),maxP=Math.max(1,+$('#maxp').value||1000);
- runAbort=ctrl;
- const pageList=parsePageIndices($('#prange').value,doc.pages,maxP);
- if(!pageList.length){setBanner('err','No valid pages in range (0..'+(doc.pages-1)+')','',100,false);return;}
- $('#out').innerHTML='';stats=[];pagesMd=[];$('#dl-md').hidden=true;summary();
- if(cardSizeObserver)cardSizeObserver.disconnect();
+function stopPolling(){pollSeq++;if(pollTimer){clearInterval(pollTimer);pollTimer=null;}}
+function statusLabel(task){
+ if(task.status==='running')return '转换中';
+ if(task.status==='queued')return task.queue_position?`排队中（第 ${task.queue_position} 位）`:'排队中';
+ if(task.status==='completed')return '已完成';
+ if(task.status==='failed')return '失败';
+ return task.status||'未知';
+}
+async function apiJson(url,options){
+ const r=await fetch(url,options);
+ const d=await r.json().catch(()=>({}));
+ if(!r.ok||d.error||d.detail)throw new Error(d.error||d.detail||r.statusText);
+ return d;
+}
+function updateTaskBanner(task){
+ const total=Math.max(1,task.total_selected||0),done=task.completed_count||0;
+ const pct=Math.round(done*100/total);
+ if(task.status==='completed')setBanner('done',`已完成：${task.task_name}`,`${done} / ${total} 页`,100,false);
+ else if(task.status==='failed')setBanner('err',`转换失败：${task.task_name}`,task.error||`${done} / ${total} 页`,pct,false);
+ else if(task.status==='queued')setBanner('run',`排队中：${task.task_name}`,`${statusLabel(task)} · ${done} / ${total} 页`,pct,true);
+ else setBanner('run',`正在转换：${task.task_name}`,`${done} / ${total} 页`,pct,false);
+ $('#rerun').hidden=task.status!=='failed';
+ $('#dl-md').hidden=done<=0;
+}
+async function loadHistory(autoSelect=false){
  try{
-  const pr=await fetch('/prepare',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:doc.id,pages:pageList}),signal:ctrl.signal});
-  const pres=await pr.json();
-  if(!pr.ok||pres.error||pres.detail)throw new Error(pres.error||pres.detail||pr.statusText);
+  historyTasks=await apiJson('/api/tasks');
+  renderHistory();
+  if(autoSelect&&!activeTask){
+   const stored=localStorage.getItem('marker_active_task');
+   const target=historyTasks.find(t=>t.id===stored)
+    ||historyTasks.find(t=>t.status==='running'||t.status==='queued')
+    ||historyTasks[0];
+   if(target)await selectTask(target.id,1);
+  }
  }catch(err){
-  if(id!==runId||(err&&err.name==='AbortError'))return;
-  setBanner('err','Could not prepare output folder: '+(err&&err.message?err.message:String(err)),'',100,false);
+  if(!historyTasks.length)$('#history').innerHTML='<div class="hint">历史记录加载失败</div>';
+ }
+}
+function renderHistory(){
+ const el=$('#history');
+ if(!historyTasks.length){el.innerHTML='<div class="hint">暂无转换记录</div>';return}
+ const scrollTop=el.scrollTop;
+ el.innerHTML=historyTasks.map(t=>`<button class="hist-item ${activeTask&&activeTask.id===t.id?'active':''}" data-id="${esc(t.id)}"><span class="hist-name">${esc(t.task_name)}</span><span class="hist-meta">${esc(statusLabel(t))} · ${t.completed_count||0}/${t.total_selected||0} 页</span></button>`).join('');
+ el.scrollTop=scrollTop;
+ el.querySelectorAll('.hist-item').forEach(b=>b.onclick=()=>selectTask(b.dataset.id,1));
+}
+function applyTaskOptions(o){
+ if(o.mode)setMode(o.mode);
+ if(o.dpi)$('#dpi').value=String(o.dpi);
+ if(o.max_pages)$('#maxp').value=o.max_pages;
+ if(o.page_range!=null)$('#prange').value=o.page_range||'';
+ $('#force_ocr').checked=!!o.force_ocr;
+ $('#use_llm').checked=!!o.use_llm;
+ $('#strip_ocr').checked=!!o.strip_existing_ocr;
+ $('#furniture').checked=!!o.keep_headers_footers;
+}
+async function selectTask(id,page=1){
+ stopPolling();
+ try{
+  activeTask=await apiJson('/api/tasks/'+encodeURIComponent(id));
+ }catch(err){
+  setBanner('err','加载任务失败：'+err.message,'',0,false);
   return;
  }
- const inflight=document.createElement('div');
- inflight.className='inflight';
- const infSpin=document.createElement('div');infSpin.className='spin';
- const infTitle=document.createElement('b');
- const infSub=document.createElement('span');infSub.className='mono';infSub.style.fontSize='12px';infSub.style.fontVariantNumeric='tabular-nums';
- inflight.append(infSpin,infTitle,infSub);
- const t0=performance.now();
- let curIdx=0,curPage=pageList[0]+1;
- const updateClock=()=>{
-  const elapsed=((performance.now()-t0)/1000).toFixed(1)+'s';
-  const pct=Math.round((curIdx/pageList.length)*100);
-  const sub=`${curIdx} / ${pageList.length} pages (${pct}%) · ${elapsed}`;
-  $('#psub').textContent=sub;
-  infSub.textContent=`${elapsed} elapsed · mode: ${o.mode}`;
- };
- const updateStage=()=>{
-  const pct=Math.round((curIdx/pageList.length)*100);
-  const elapsed=((performance.now()-t0)/1000).toFixed(1)+'s';
-  const sub=`${curIdx} / ${pageList.length} pages (${pct}%) · ${elapsed}`;
-  setBanner('run',`Converting Page ${curPage} (${curIdx+1} of ${pageList.length}) · mode: ${o.mode}`,sub,pct,curIdx===0);
-  infTitle.textContent=`Converting Page ${curPage} (${curIdx+1} of ${pageList.length})…`;
-  infSub.textContent=`${elapsed} elapsed · mode: ${o.mode}`;
- };
- $('#out').appendChild(inflight);
- updateStage();
- timerId=setInterval(updateClock,250);
- for(let idx=0;idx<pageList.length;idx++){
-  if(id!==runId)return;
-  curIdx=idx;curPage=pageList[idx]+1;
-  updateStage();
-  const n=pageList[idx];
-  let p;
-  try{
-   const resp=await fetch('/page',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:doc.id,n,opts:o}),signal:ctrl.signal});
-   p=await resp.json();
-  }catch(err){
-   if(id!==runId||(err&&err.name==='AbortError'))return;
-   stopTimer();inflight.remove();
-   setBanner('err',`Error on page ${n+1}: ${err&&err.message?err.message:String(err)}`,`${idx} / ${pageList.length} pages completed`,100,false);
-   return;
-  }
-  if(id!==runId)return;
-  if(p.error||p.detail){
-   stopTimer();
-   inflight.remove();
-   setBanner('err',`Error on page ${n+1}: ${p.error||p.detail}`,`${idx} / ${pageList.length} pages completed`,100,false);
-   return;
-  }
-  render(p,inflight);
-  stats.push(p.timings);if(p.markdown)pagesMd.push(p.markdown);$('#dl-md').hidden=!pagesMd.length;summary();
- }
- stopTimer();
- inflight.remove();
- const totMs=performance.now()-t0;
- const avgMs=(totMs/pageList.length).toFixed(0);
- const pps=(1000*pageList.length/Math.max(1,totMs)).toFixed(1);
- setBanner('done',`Converted ${pageList.length} page${pageList.length>1?'s':''} in ${(totMs/1000).toFixed(2)}s`,`${avgMs} ms/page · ${pps} pages/s`,100,false);
+ localStorage.setItem('marker_active_task',id);
+ $('#fname').textContent=activeTask.task_name||'';
+ applyTaskOptions(activeTask.options||{});
+ renderHistory();
+ updateTaskBanner(activeTask);
+ $('#pager').hidden=false;
+ const storedPage=parseInt(localStorage.getItem('marker_page_'+id)||'',10);
+ if(page===1&&storedPage>0)page=storedPage;
+ await loadPageWindow(id,page);
+ pollActiveTask();
 }
+async function loadPageWindow(id,page){
+ const seq=++windowSeq;
+ let data;
+ try{
+  data=await apiJson(`/api/tasks/${encodeURIComponent(id)}/pages?page=${page}&page_size=${pageSize}`);
+ }catch(err){
+  if(seq===windowSeq)setBanner('err','加载页面结果失败：'+err.message,'',0,false);
+  return;
+ }
+ if(seq!==windowSeq)return;
+ activeTask=data.task;currentPage=data.page;
+ localStorage.setItem('marker_page_'+id,String(currentPage));
+ $('#pager').hidden=false;
+ $('#page-info').textContent=`第 ${data.page} / ${data.total_pages} 页`;
+ $('#page-summary').textContent=`已完成 ${data.completed_count} / ${data.total_selected} 页 · 本页显示 ${data.page_size} 条`;
+ $('#prev-page').disabled=data.page<=1;
+ $('#next-page').disabled=data.page>=data.total_pages;
+ $('#out').innerHTML='';stats=[];
+ if(cardSizeObserver)cardSizeObserver.disconnect();
+ const completed=data.items.filter(item=>item.completed&&item.result);
+ currentWindowIndices=data.items.map(item=>item.page_index);
+ renderedCompleted=new Set(completed.map(item=>item.page_index));
+ if(!completed.length){
+  $('#out').innerHTML='<div class="empty"><h2>当前分页尚未完成</h2>转换会在后台继续，完成后自动显示。</div>';
+ }else{
+  completed.forEach(item=>{render(item.result);stats.push(item.result.timings||{});});
+ }
+ updateTaskBanner(activeTask);
+ summary();
+}
+function pollActiveTask(){
+ const id=activeTask&&activeTask.id;
+ if(!id)return;
+ const seq=++pollSeq;
+ pollTimer=setInterval(async()=>{
+  if(seq!==pollSeq||!activeTask||activeTask.id!==id)return;
+  try{
+   const task=await apiJson('/api/tasks/'+encodeURIComponent(id));
+   activeTask=task;
+   updateTaskBanner(task);
+   renderHistory();
+   const hasNewPage=(task.completed_pages||[]).some(
+    page=>currentWindowIndices.includes(page)&&!renderedCompleted.has(page)
+   );
+   if(hasNewPage){
+    await loadPageWindow(id,currentPage);
+   }
+   if(task.status==='completed'||task.status==='failed')stopPolling();
+  }catch(_){}
+ },1000);
+}
+async function retryActiveTask(){
+ if(!activeTask)return;
+ try{
+  await apiJson('/api/tasks/'+encodeURIComponent(activeTask.id)+'/retry',{method:'POST'});
+  await selectTask(activeTask.id,1);
+ }catch(err){
+  setBanner('err','重试失败：'+err.message,'',0,false);
+ }
+}
+$('#prev-page').onclick=()=>activeTask&&loadPageWindow(activeTask.id,currentPage-1);
+$('#next-page').onclick=()=>activeTask&&loadPageWindow(activeTask.id,currentPage+1);
 
 function summary(){
  const el=$('#stats');if(!stats.length){el.innerHTML='';return}
  const n=stats.length,s=k=>stats.reduce((a,t)=>a+(t[k]||0),0),tot=Math.max(1,s('total_ms'));
- el.innerHTML=`<b>${(tot/n).toFixed(0)} ms</b> per page · <b>${(1000*n/tot).toFixed(1)}</b> pages/s<br>`+
-  STAGES.filter(([k])=>s(k)>0).map(([k,l])=>`${l} ${(s(k)/n).toFixed(0)} ms`).join(' · ');
+ el.innerHTML=`<b>${(tot/n).toFixed(0)} 毫秒</b>/页 · <b>${(1000*n/tot).toFixed(1)}</b> 页/秒<br>`+
+  STAGES.filter(([k])=>s(k)>0).map(([k,l])=>`${l} ${(s(k)/n).toFixed(0)} 毫秒`).join(' · ');
 }
 
-function render(p,beforeEl){
+function render(p){
  const c=document.createElement('div');c.className='card';const t=p.timings||{},tot=t.total_ms||1;
  const u=Math.max(1,p.w/640);
- const srcMap={text:'Text layer + Indra',no_ocr:'Text layer (No OCR)',indra:'Indra ONNX OCR',hybrid:'Hybrid (Text + VLM)',surya:'Surya VLM',error:'Error'};
+ const srcMap={text:'文本层 + Indra',no_ocr:'文本层（无 OCR）',indra:'Indra ONNX OCR',hybrid:'混合（文本 + VLM）',surya:'Surya VLM',error:'错误'};
  const src=srcMap[p.source]||p.source;
- const bar=STAGES.map(([k,l,col])=>`<i style="width:${100*(t[k]||0)/tot}%;background:${col}" title="${l}: ${t[k]||0} ms"></i>`).join('');
- const extra=(p.images_count?` · ${p.images_count} image${p.images_count>1?'s':''}`:'')+(p.mode_used?` · ${p.mode_used}`:'');
+ const bar=STAGES.map(([k,l,col])=>`<i style="width:${100*(t[k]||0)/tot}%;background:${col}" title="${l}: ${t[k]||0} 毫秒"></i>`).join('');
+ const extra=(p.images_count?` · ${p.images_count} 张图片`:'')+(p.mode_used?` · ${MODE_NAMES[p.mode_used]||p.mode_used}`:'');
  const blocks=p.blocks.map((b,k)=>{
   const col=BLOCK[b.label]||'oklch(55% .02 263)',[x0,y0,x1,y1]=b.box;
-  return `<rect class="bk" data-b="${k}" x="${x0-2}" y="${y0-2}" width="${Math.max(2,x1-x0+4)}" height="${Math.max(2,y1-y0+4)}" stroke="${col}"/><text class="bl" data-b="${k}" x="${x0}" y="${Math.max(11*u,y0-4*u)}" fill="${col}" font-size="${10.5*u}" stroke-width="${3*u}">${esc(b.label)}</text>`;
+  return `<rect class="bk" data-b="${k}" x="${x0-2}" y="${y0-2}" width="${Math.max(2,x1-x0+4)}" height="${Math.max(2,y1-y0+4)}" stroke="${col}"/><text class="bl" data-b="${k}" x="${x0}" y="${Math.max(11*u,y0-4*u)}" fill="${col}" font-size="${10.5*u}" stroke-width="${3*u}">${esc(blockName(b.label))}</text>`;
  }).join('');
  const lines=p.lines.map((l,k)=>`<rect class="ln" data-k="${k}" x="${l.box[0]}" y="${l.box[1]}" width="${Math.max(1,l.box[2]-l.box[0])}" height="${Math.max(1,l.box[3]-l.box[1])}"/>`).join('');
  const activeBlocks=p.blocks.filter(b=>!b.ignored);
@@ -1167,22 +1426,22 @@ function render(p,beforeEl){
  const nums=cen.map((pt,k)=>`<circle class="on-n" cx="${pt[0]}" cy="${pt[1]}" r="${7.5*u}"/><text class="n" x="${pt[0]}" y="${pt[1]}" font-size="${8.5*u}">${k+1}</text>`).join('');
  const blockRows=p.blocks.map((b,k)=>{
   const col=BLOCK[b.label]||'oklch(55% .02 263)';
-  const snippet=(b.text||'').slice(0,220)||'(image / non-text block)';
-  return `<div class="bk-row ${b.ignored?'ignored':''}" data-b="${k}"><span class="k">${k+1}</span><span class="btag" style="border-left:3px solid ${col}">${esc(b.label)}</span><span class="t">${esc(snippet)}</span><span class="meta">${esc(b.source||'')}</span></div>`;
+  const snippet=(b.text||'').slice(0,220)||'（图片/非文本区块）';
+  return `<div class="bk-row ${b.ignored?'ignored':''}" data-b="${k}"><span class="k">${k+1}</span><span class="btag" style="border-left:3px solid ${col}">${esc(blockName(b.label))}</span><span class="t">${esc(snippet)}</span><span class="meta">${esc(SOURCE_NAMES[b.source]||b.source||'')}</span></div>`;
  }).join('');
- const lineRows=p.lines.map((l,k)=>`<div class="ln-row" data-k="${k}"><span class="k">${k+1}</span><span class="t">${esc(l.text)||'<span style="color:var(--ink-4)">(no text)</span>'}</span></div>`).join('');
- const tabs=['Preview','Markdown','Blocks','Lines','HTML','Chunks','JSON'];
- c.innerHTML=`<div class="ch"><h3>Page ${p.page}</h3><span class="chip ${p.source}">${esc(src)}</span><span class="meta">${p.blocks.length} blocks · ${p.lines.length} lines${esc(extra)}</span><span class="sp"></span><div class="tbar">${bar}</div><span class="meta">${t.total_ms} ms</span></div>
+ const lineRows=p.lines.map((l,k)=>`<div class="ln-row" data-k="${k}"><span class="k">${k+1}</span><span class="t">${esc(l.text)||'<span style="color:var(--ink-4)">（无文本）</span>'}</span></div>`).join('');
+ const tabs=['预览','Markdown','区块','文本行','HTML','分块','JSON'];
+ c.innerHTML=`<div class="ch"><h3>第 ${p.page} 页</h3><span class="chip ${p.source}">${esc(src)}</span><span class="meta">${p.blocks.length} 个区块 · ${p.lines.length} 行${esc(extra)}</span><span class="sp"></span><div class="tbar">${bar}</div><span class="meta">${t.total_ms} 毫秒</span></div>
  <div class="body">
   <div class="pageview"><svg class="pg" viewBox="0 0 ${p.w} ${p.h}"><image href="${p.img}" width="${p.w}" height="${p.h}"/>${blocks}${lines}${ord}${nums}</svg></div>
   <div class="right">
-   <div class="tabs">${tabs.map((n,i)=>`<button data-tab="${n}" class="${i?'':'on'}">${n}</button>`).join('')}<span class="sp"></span><button class="copy-btn" data-copy="1">Copy Markdown</button></div>
-   <div class="pane preview" data-pane="Preview">${p.preview_html||'<span class="meta">(Empty page)</span>'}</div>
+   <div class="tabs">${tabs.map((n,i)=>`<button data-tab="${n}" class="${i?'':'on'}">${n}</button>`).join('')}<span class="sp"></span><button class="copy-btn" data-copy="1">复制 Markdown</button></div>
+   <div class="pane preview" data-pane="预览">${p.preview_html||'<span class="meta">（空页面）</span>'}</div>
    <div class="pane src" data-pane="Markdown" hidden>${esc(p.markdown||'')}</div>
-   <div class="pane" data-pane="Blocks" hidden>${blockRows||'<span class="meta">No blocks detected.</span>'}</div>
-   <div class="pane" data-pane="Lines" hidden>${lineRows||'<span class="meta">No line boxes (full-page VLM blocks).</span>'}</div>
+   <div class="pane" data-pane="区块" hidden>${blockRows||'<span class="meta">未检测到区块。</span>'}</div>
+   <div class="pane" data-pane="文本行" hidden>${lineRows||'<span class="meta">无文本行（整页 VLM 区块）。</span>'}</div>
    <div class="pane src" data-pane="HTML" hidden>${esc(p.html||'')}</div>
-   <div class="pane src" data-pane="Chunks" hidden>${esc(JSON.stringify(p.chunks||[],null,2))}</div>
+   <div class="pane src" data-pane="分块" hidden>${esc(JSON.stringify(p.chunks||[],null,2))}</div>
    <div class="pane src" data-pane="JSON" hidden>${esc(JSON.stringify(p.json||{},null,2))}</div>
   </div>
  </div>`;
@@ -1191,7 +1450,7 @@ function render(p,beforeEl){
   c.querySelectorAll('.pane').forEach(x=>x.hidden=x.dataset.pane!==b.dataset.tab);
  });
  const copyBtn=c.querySelector('.copy-btn');
- if(copyBtn)copyBtn.onclick=()=>{navigator.clipboard.writeText(p.markdown||'');copyBtn.textContent='Copied!';setTimeout(()=>copyBtn.textContent='Copy Markdown',1200);};
+ if(copyBtn)copyBtn.onclick=()=>{navigator.clipboard.writeText(p.markdown||'');copyBtn.textContent='已复制';setTimeout(()=>copyBtn.textContent='复制 Markdown',1200);};
  const hlLine=k=>c.querySelectorAll('[data-k]').forEach(el=>el.classList.toggle('on',el.dataset.k==k));
  const hlBlock=b=>c.querySelectorAll('[data-b]').forEach(el=>el.classList.toggle('on',el.dataset.b==b));
  c.querySelectorAll('.ln-row').forEach(el=>{el.onmouseenter=()=>hlLine(el.dataset.k);el.onmouseleave=()=>hlLine(-1)});
@@ -1201,8 +1460,7 @@ function render(p,beforeEl){
   el.onmouseenter=()=>{hlBlock(el.dataset.b);const r=c.querySelector(`.bk-row[data-b="${el.dataset.b}"]`);r&&r.scrollIntoView({block:'nearest'})};
   el.onmouseleave=()=>hlBlock(-1);
  });
- if(beforeEl&&beforeEl.parentNode===$('#out'))$('#out').insertBefore(c,beforeEl);
- else $('#out').appendChild(c);
+ $('#out').appendChild(c);
  observeCardSize(c);
 }
 </script></body></html>"""

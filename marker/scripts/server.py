@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 import io
 import os
 import tempfile
+import threading
 from typing import Annotated, Any, Dict, Literal, Optional
 import urllib.parse
 
@@ -33,7 +34,8 @@ from marker.converters.pdf import PdfConverter
 from marker.logger import get_logger
 from marker.models import create_model_dict
 from marker.output import text_from_rendered
-from marker.scripts.viewer import ViewerEngine, render_viewer_html
+from marker.scripts.viewer import MODES, ViewerEngine, render_viewer_html
+from marker.scripts.web_tasks import TaskManager
 from marker.settings import settings
 
 logger = get_logger()
@@ -72,6 +74,21 @@ def _get_models() -> Dict[str, Any]:
 
 
 viewer_engine = ViewerEngine(model_supplier=_get_models)
+task_manager: Optional[TaskManager] = None
+task_manager_lock = threading.Lock()
+
+
+def _query_bool(params, name: str) -> bool:
+    return str(params.get(name, "")).lower() in {"1", "true", "yes", "on"}
+
+
+def _get_task_manager() -> TaskManager:
+    global task_manager
+    with task_manager_lock:
+        if task_manager is None:
+            task_manager = TaskManager(viewer_engine)
+        task_manager.start()
+        return task_manager
 
 
 def _get_allowed_dir() -> str:
@@ -104,9 +121,12 @@ def _validate_local_filepath(filepath: str) -> str:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app_data["models"] = create_model_dict()
+    _get_task_manager().start()
 
     yield
 
+    if task_manager is not None:
+        task_manager.stop()
     if "models" in app_data:
         from marker.models import shutdown_models
 
@@ -199,6 +219,136 @@ if _HAS_FASTAPI:
         return Response(
             content=data, media_type="application/zip", headers=headers
         )
+
+    @app.post("/api/tasks")
+    async def api_create_task(request: Request):
+        filename = urllib.parse.unquote(
+            request.headers.get("X-Filename", "document.pdf")
+        )
+        body = await request.body()
+        if len(body) > MAX_UPLOAD_SIZE:
+            return JSONResponse(
+                status_code=413,
+                content={"error": "上传文件超过大小限制。"},
+            )
+        query = request.query_params
+        mode = str(query.get("mode") or "auto").lower()
+        if mode not in MODES:
+            return JSONResponse(
+                status_code=400,
+                content={"error": f"不支持的模式：{mode}"},
+            )
+        try:
+            dpi = max(72, min(300, int(query.get("dpi") or 300)))
+            max_pages = max(1, int(query.get("max_pages") or 1000))
+        except (TypeError, ValueError):
+            return JSONResponse(
+                status_code=400,
+                content={"error": "DPI 或最大页数格式不正确。"},
+            )
+        options = {
+            "mode": mode,
+            "dpi": dpi,
+            "max_pages": max_pages,
+            "page_range": query.get("page_range") or "",
+            "force_ocr": _query_bool(query, "force_ocr"),
+            "use_llm": _query_bool(query, "use_llm"),
+            "strip_existing_ocr": _query_bool(
+                query, "strip_existing_ocr"
+            ),
+            "keep_headers_footers": _query_bool(
+                query, "keep_headers_footers"
+            ),
+        }
+        try:
+            return await run_in_threadpool(
+                _get_task_manager().create_task,
+                body,
+                filename,
+                options,
+            )
+        except ValueError as exc:
+            return JSONResponse(status_code=400, content={"error": str(exc)})
+        except Exception:
+            logger.exception("Web task creation failed")
+            return JSONResponse(
+                status_code=400, content={"error": "创建转换任务失败。"}
+            )
+
+    @app.get("/api/tasks")
+    async def api_list_tasks():
+        return await run_in_threadpool(_get_task_manager().list_tasks)
+
+    @app.get("/api/tasks/{task_id}")
+    async def api_get_task(task_id: str):
+        try:
+            return await run_in_threadpool(
+                _get_task_manager().get_task, task_id
+            )
+        except ValueError as exc:
+            return JSONResponse(status_code=404, content={"error": str(exc)})
+
+    @app.get("/api/tasks/{task_id}/pages")
+    async def api_get_task_pages(
+        task_id: str, page: int = 1, page_size: int = 10
+    ):
+        try:
+            return await run_in_threadpool(
+                _get_task_manager().page_window,
+                task_id,
+                page,
+                page_size,
+            )
+        except ValueError as exc:
+            return JSONResponse(status_code=404, content={"error": str(exc)})
+
+    @app.get("/api/tasks/{task_id}/pages/{page_index}")
+    async def api_get_task_page(task_id: str, page_index: int):
+        try:
+            return JSONResponse(
+                await run_in_threadpool(
+                    _get_task_manager().page_result, task_id, page_index
+                )
+            )
+        except ValueError as exc:
+            return JSONResponse(status_code=404, content={"error": str(exc)})
+
+    @app.get("/api/tasks/{task_id}/pages/{page_index}/image")
+    async def api_get_task_page_image(task_id: str, page_index: int):
+        image_path = _get_task_manager().page_image_path(task_id, page_index)
+        if not os.path.isfile(image_path):
+            return JSONResponse(
+                status_code=404, content={"error": "页面图片不存在。"}
+            )
+        with open(image_path, "rb") as f:
+            return Response(content=f.read(), media_type="image/jpeg")
+
+    @app.get("/api/tasks/{task_id}/download")
+    async def api_download_task(task_id: str):
+        try:
+            data, filename = await run_in_threadpool(
+                _get_task_manager().download_zip, task_id
+            )
+        except ValueError as exc:
+            return JSONResponse(status_code=404, content={"error": str(exc)})
+        headers = {
+            "Content-Disposition": (
+                "attachment; filename*=UTF-8''"
+                + urllib.parse.quote(filename)
+            )
+        }
+        return Response(
+            content=data, media_type="application/zip", headers=headers
+        )
+
+    @app.post("/api/tasks/{task_id}/retry")
+    async def api_retry_task(task_id: str):
+        try:
+            return await run_in_threadpool(
+                _get_task_manager().retry_task, task_id
+            )
+        except ValueError as exc:
+            return JSONResponse(status_code=404, content={"error": str(exc)})
 else:
     app = None
 

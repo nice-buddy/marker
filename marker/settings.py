@@ -30,18 +30,25 @@ def _is_apple_silicon() -> bool:
     return platform.system() == "Darwin" and platform.machine() == "arm64"
 
 
-def _default_output_dir() -> str:
-    """Default to ``outputs`` beside the active virtualenv (the app directory)."""
+def _default_app_dir() -> str:
     prefix = Path(sys.prefix)
     if (prefix / "pyvenv.cfg").is_file():
-        return str(prefix.parent / "outputs")
-    return str(Path.cwd() / "outputs")
+        return str(prefix.parent)
+    return str(Path.cwd())
+
+
+def _default_output_dir() -> str:
+    """Default to ``outputs`` beside the active virtualenv (the app directory)."""
+    return str(Path(_default_app_dir()) / "outputs")
 
 
 class Settings(BaseSettings):
     # Paths
     BASE_DIR: str = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    APP_DIR: str = _default_app_dir()
     OUTPUT_DIR: str = _default_output_dir()
+    INPUT_DIR: str = os.path.join(APP_DIR, "inputs")
+    HISTORY_DIR: str = os.path.join(APP_DIR, "history")
     # The rendering font is a runtime download; keep it out of the package tree, which may
     # be read-only (site-packages) or a git checkout (editable install).
     FONT_DIR: str = os.path.join(

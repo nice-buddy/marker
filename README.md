@@ -144,8 +144,14 @@ marker_gui --port 8000
 
 Then open `http://localhost:8000` in your browser (pass `--streamlit` if you want the legacy Streamlit UI).
 
-Converted pages are saved under `outputs/<document-name>/` beside the virtualenv, and the
+CLI conversions are saved under `outputs/<document-name>/` beside the virtualenv, and the
 Markdown download is a `.zip` containing `<document-name>.md` plus the `images/` folder.
+WebUI tasks use timestamped task names (see below).
+
+The WebUI uses a Chinese interface and a persistent single-worker task queue. Uploaded files
+are kept in `inputs/`, task history and resumable progress are stored in `history/`, and page
+results are displayed with server-side pagination so large PDFs do not load every page into
+the browser at once.
 
 ## Convert a single file
 

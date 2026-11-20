@@ -161,10 +161,10 @@ def test_viewer_endpoints_and_ui():
     root_resp = client.get("/")
     assert root_resp.status_code == 200
     html = root_resp.text
-    assert "Marker Viewer · Datalab" in html
+    assert "Marker 文档转换器" in html
     for mode in ("auto", "no_ocr", "fast", "balanced", "vllm"):
         assert f'data-v="{mode}"' in html
-    for tab in ("Preview", "Markdown", "Blocks", "Lines", "HTML", "Chunks", "JSON"):
+    for tab in ("预览", "Markdown", "区块", "文本行", "HTML", "分块", "JSON"):
         assert tab in html
 
     # 2. GET /info returns version, modes, and defaults
@@ -182,7 +182,7 @@ def test_viewer_endpoints_and_ui():
         headers={"X-Filename": "exploit.exe"},
     )
     assert bad_up.status_code == 400
-    assert "Unsupported file type" in bad_up.json()["error"]
+    assert "不支持的文件类型" in bad_up.json()["error"]
 
     # 4. POST /upload accepts a valid image and returns document id + page count
     img = Image.new("RGB", (600, 400), color="white")
