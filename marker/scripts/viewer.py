@@ -903,6 +903,30 @@ def make_handler(engine: ViewerEngine):
                     ).encode("utf-8"),
                 )
 
+        def do_PATCH(self):
+            parsed = urllib.parse.urlparse(self.path)
+            match = re.fullmatch(r"/api/tasks/([^/]+)", parsed.path)
+            if not match:
+                return self._send(404, b"not found", "text/plain")
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length)
+            try:
+                options = json.loads(body or b"{}")
+                result = get_task_manager().update_task_options(
+                    match.group(1), options
+                )
+                self._send(
+                    200,
+                    json.dumps(result, ensure_ascii=False).encode("utf-8"),
+                )
+            except Exception as exc:
+                self._send(
+                    409,
+                    json.dumps(
+                        {"error": str(exc)}, ensure_ascii=False
+                    ).encode("utf-8"),
+                )
+
     return Handler
 
 
@@ -1094,7 +1118,8 @@ footer{padding:18px 24px;border-top:var(--hairline) solid var(--rule);display:fl
    <div class="field"><span class="label">最大页数</span><input id="maxp" type="number" min="1" value="1000"></div>
   </div>
   <div class="field"><span class="label">页码范围（从 0 开始）</span><input id="prange" type="text" placeholder="全部（或例如 0,2-5）"></div>
-  <div class="hint">上传后按当前设置加入队列；已有任务不会被修改。</div>
+  <div class="hint">上传后按当前设置加入队列；排队中的任务可修改后保存。</div>
+  <button class="btn" id="save-options" hidden>保存任务参数</button>
   <button class="btn" id="rerun" hidden>重试当前任务</button>
  </div>
  <div class="group"><div class="label">显示</div>
@@ -1108,7 +1133,6 @@ footer{padding:18px 24px;border-top:var(--hairline) solid var(--rule);display:fl
   <div id="status"></div>
   <div id="stats"></div>
   <div class="task-actions">
-   <button class="btn-sec danger" id="cancel-task" hidden>终止任务</button>
    <button class="btn-sec danger" id="delete-task" hidden>删除任务</button>
   </div>
   <button class="btn-sec" id="dl-md" hidden>下载 Markdown（.zip）</button>
@@ -1122,6 +1146,7 @@ footer{padding:18px 24px;border-top:var(--hairline) solid var(--rule);display:fl
    <div class="pbadge" id="pbadge" hidden>✓</div>
    <div class="ptitle" id="ptitle">正在转换文档…</div>
    <div class="psub" id="psub">0 / 0 页</div>
+   <button class="btn-sec danger" id="banner-cancel" hidden>终止任务</button>
    <button class="btn-sec" id="pbanner-dl" hidden>下载 .zip</button>
   </div>
   <div class="ptrack"><div class="pfill indet" id="pfill" style="width:0%"></div></div>
@@ -1315,11 +1340,21 @@ function statusLabel(task){
 function fmtDuration(seconds){
  if(seconds==null||!Number.isFinite(seconds)||seconds<0)return '—';
  if(seconds<60)return `${seconds.toFixed(1)} 秒`;
+ if(seconds>=3600){
+  const hours=Math.floor(seconds/3600),minutes=Math.round((seconds%3600)/60);
+  return `${hours} 小时 ${minutes} 分`;
+ }
  const minutes=Math.floor(seconds/60),rest=Math.round(seconds%60);
  return `${minutes} 分 ${rest} 秒`;
 }
 function elapsedLabel(task){
  return task.started_at?fmtDuration(task.elapsed_seconds):'—';
+}
+function etaLabel(task){
+ if(task.status!=='running'||!task.completed_count||!task.elapsed_seconds)return null;
+ const remaining=Math.max(0,(task.total_selected||0)-task.completed_count);
+ if(remaining===0)return '0.0 秒';
+ return fmtDuration(task.elapsed_seconds/task.completed_count*remaining);
 }
 async function apiJson(url,options){
  const r=await fetch(url,options);
@@ -1331,16 +1366,18 @@ function updateTaskBanner(task){
  const total=Math.max(1,task.total_selected||0),done=task.completed_count||0;
  const pct=Math.round(done*100/total);
  const elapsed=elapsedLabel(task);
+ const eta=etaLabel(task);
  if(task.status==='completed')setBanner('done',`已完成：${task.task_name}`,`${done} / ${total} 页 · 总耗时 ${elapsed}`,100,false);
  else if(task.status==='failed')setBanner('err',`转换失败：${task.task_name}`,`${done} / ${total} 页 · 耗时 ${elapsed}`,pct,false);
  else if(task.status==='cancelled')setBanner('err',`已取消：${task.task_name}`,`${done} / ${total} 页 · 耗时 ${elapsed}`,pct,false);
  else if(task.status==='cancelling')setBanner('run',`正在终止：${task.task_name}`,`${done} / ${total} 页 · 已用 ${elapsed}`,pct,false);
  else if(task.status==='queued')setBanner('run',`排队中：${task.task_name}`,`${statusLabel(task)} · ${done} / ${total} 页`,pct,true);
- else setBanner('run',`正在转换：${task.task_name}`,`${done} / ${total} 页 · 已用 ${elapsed}`,pct,false);
+ else setBanner('run',`正在转换：${task.task_name}`,`${done} / ${total} 页 · 已用 ${elapsed} · 预计还需 ${eta||'估算中'}`,pct,false);
  $('#rerun').hidden=!['failed','cancelled'].includes(task.status);
- $('#cancel-task').hidden=!['queued','running','cancelling'].includes(task.status);
- $('#cancel-task').disabled=task.status==='cancelling';
- $('#cancel-task').textContent=task.status==='cancelling'?'正在终止…':'终止任务';
+ $('#save-options').hidden=!(task.status==='queued'&&done===0);
+ $('#banner-cancel').hidden=!['queued','running','cancelling'].includes(task.status);
+ $('#banner-cancel').disabled=task.status==='cancelling';
+ $('#banner-cancel').textContent=task.status==='cancelling'?'正在终止…':'终止任务';
  $('#delete-task').hidden=['running','cancelling'].includes(task.status);
  $('#dl-md').hidden=done<=0;
 }
@@ -1481,8 +1518,11 @@ function pollActiveTask(){
  pollTimer=setInterval(async()=>{
   if(seq!==pollSeq||!activeTask||activeTask.id!==id)return;
   try{
-   const task=await apiJson('/api/tasks/'+encodeURIComponent(id));
-   activeTask=task;
+   const [task,tasks]=await Promise.all([
+    apiJson('/api/tasks/'+encodeURIComponent(id)),
+    apiJson('/api/tasks')
+   ]);
+   activeTask=task;historyTasks=tasks;
    updateTaskBanner(task);
    if(!isDragging)renderHistory();
    const hasNewPage=(task.completed_pages||[]).some(
@@ -1491,7 +1531,10 @@ function pollActiveTask(){
    if(hasNewPage){
     await loadPageWindow(id,currentPage);
    }
-   if(['completed','failed','cancelled'].includes(task.status))stopPolling();
+   if(['completed','failed','cancelled'].includes(task.status)){
+    const hasActive=historyTasks.some(t=>['running','queued','cancelling'].includes(t.status));
+    if(!hasActive)stopPolling();
+   }
   }catch(_){}
  },1000);
 }
@@ -1502,6 +1545,30 @@ async function retryActiveTask(){
   await selectTask(activeTask.id,1);
  }catch(err){
   setBanner('err','重试失败：'+err.message,'',0,false);
+ }
+}
+async function saveQueuedOptions(){
+ if(!activeTask)return;
+ const btn=$('#save-options');
+ const o=opts();
+ const payload={
+  ...o,
+  max_pages:Math.max(1,+$('#maxp').value||1000),
+  page_range:$('#prange').value||''
+ };
+ btn.disabled=true;
+ try{
+  const task=await apiJson('/api/tasks/'+encodeURIComponent(activeTask.id),{
+   method:'PATCH',headers:{'Content-Type':'application/json'},
+   body:JSON.stringify(payload)
+  });
+  activeTask=task;updateTaskBanner(task);await loadHistory();
+  await loadPageWindow(task.id,1);
+  btn.textContent='已保存';
+  setTimeout(()=>{btn.textContent='保存任务参数';btn.disabled=false},1200);
+ }catch(err){
+  btn.disabled=false;
+  setBanner('err','保存参数失败：'+err.message,'',0,false);
  }
 }
 async function cancelActiveTask(){
@@ -1527,8 +1594,9 @@ async function deleteActiveTask(){
   $('#out').innerHTML='<div class="empty"><h2>转换文档</h2>拖放 PDF、图片或 Office 文档。转换结果会按页分页展示，历史任务可随时恢复。</div>';
   $('#pager').hidden=true;$('#pbanner').hidden=true;
   $('#status').textContent='';$('#stats').innerHTML='';$('#fname').textContent='';
-  $('#cancel-task').hidden=true;$('#delete-task').hidden=true;
-  $('#rerun').hidden=true;$('#dl-md').hidden=true;
+  $('#delete-task').hidden=true;
+  $('#rerun').hidden=true;$('#save-options').hidden=true;
+  $('#banner-cancel').hidden=true;$('#dl-md').hidden=true;
   await loadHistory(true);
  }catch(err){
   setBanner('err','删除任务失败：'+err.message,'',0,false);
@@ -1536,7 +1604,8 @@ async function deleteActiveTask(){
 }
 $('#prev-page').onclick=()=>activeTask&&loadPageWindow(activeTask.id,currentPage-1);
 $('#next-page').onclick=()=>activeTask&&loadPageWindow(activeTask.id,currentPage+1);
-$('#cancel-task').onclick=cancelActiveTask;
+$('#banner-cancel').onclick=cancelActiveTask;
+$('#save-options').onclick=saveQueuedOptions;
 $('#delete-task').onclick=deleteActiveTask;
 
 function summary(){

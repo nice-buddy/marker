@@ -251,3 +251,37 @@ def test_completed_tasks_sort_to_end_and_elapsed(tmp_path, monkeypatch):
             "finished_at": "2026-01-01T00:01:05+00:00",
         }
     ) == 65.0
+
+
+def test_update_options_only_for_unstarted_queued_tasks(tmp_path, monkeypatch):
+    manager = _make_manager(tmp_path, monkeypatch)
+    task = _create_task(manager)
+
+    updated = manager.update_task_options(
+        task["id"],
+        {
+            "mode": "fast",
+            "dpi": 200,
+            "max_pages": 2,
+            "page_range": "1-2",
+            "force_ocr": True,
+            "use_llm": False,
+            "strip_existing_ocr": False,
+            "keep_headers_footers": True,
+        },
+    )
+    assert updated["options"]["mode"] == "fast"
+    assert updated["options"]["dpi"] == 200
+    assert updated["options"]["force_ocr"] is True
+    assert updated["options"]["keep_headers_footers"] is True
+    assert updated["selected_pages"] == [1, 2]
+    assert updated["total_selected"] == 2
+
+    claimed = manager.store.claim_next_queued()
+    with pytest.raises(ValueError):
+        manager.update_task_options(task["id"], {"mode": "vllm"})
+
+    assert manager._process_task(claimed)
+    assert manager.engine.calls == [1, 2]
+    with pytest.raises(ValueError):
+        manager.update_task_options(task["id"], {"mode": "vllm"})

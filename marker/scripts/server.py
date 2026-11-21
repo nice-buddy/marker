@@ -149,6 +149,17 @@ class TaskReorderParams(BaseModel):
     task_ids: list[str] = Field(default_factory=list)
 
 
+class TaskOptionsUpdate(BaseModel):
+    mode: str = "auto"
+    dpi: int = 300
+    max_pages: int = 1000
+    page_range: str = ""
+    force_ocr: bool = False
+    use_llm: bool = False
+    strip_existing_ocr: bool = False
+    keep_headers_footers: bool = False
+
+
 if _HAS_FASTAPI:
     app = FastAPI(
         title="Marker API & Interactive Viewer",
@@ -288,6 +299,19 @@ if _HAS_FASTAPI:
         try:
             return await run_in_threadpool(
                 _get_task_manager().reorder_queued, params.task_ids
+            )
+        except ValueError as exc:
+            return JSONResponse(status_code=409, content={"error": str(exc)})
+
+    @app.patch("/api/tasks/{task_id}")
+    async def api_update_task_options(
+        task_id: str, params: TaskOptionsUpdate
+    ):
+        try:
+            return await run_in_threadpool(
+                _get_task_manager().update_task_options,
+                task_id,
+                params.model_dump(),
             )
         except ValueError as exc:
             return JSONResponse(status_code=409, content={"error": str(exc)})

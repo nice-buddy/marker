@@ -24,6 +24,7 @@ from marker.providers.registry import provider_from_filepath
 from marker.scripts.viewer import (
     ALLOWED_EXTENSIONS,
     IMAGE_EXTENSIONS,
+    MODES,
     _parse_page_range_spec,
 )
 from marker.settings import settings
@@ -391,6 +392,42 @@ class TaskStore:
             )
         return self.get_task(task_id)
 
+    def update_queued_task(
+        self,
+        task_id: str,
+        options: Dict[str, Any],
+        selected_pages: List[int],
+    ) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT t.status,
+                       (SELECT COUNT(*) FROM task_pages p WHERE p.task_id = t.id)
+                           AS completed_count
+                FROM tasks t
+                WHERE t.id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            if row["status"] != "queued" or row["completed_count"]:
+                raise ValueError("只有尚未开始的排队任务可以修改参数。")
+            conn.execute(
+                """
+                UPDATE tasks
+                SET options = ?, selected_pages = ?, updated_at = ?
+                WHERE id = ? AND status = 'queued'
+                """,
+                (
+                    _dump_json(options),
+                    _dump_json(selected_pages),
+                    _now_iso(),
+                    task_id,
+                ),
+            )
+        return self.get_task(task_id)
+
     def cancel_task(self, task_id: str) -> Optional[Dict[str, Any]]:
         now = _now_iso()
         with self._connect() as conn:
@@ -673,6 +710,45 @@ class TaskManager:
             raise ValueError("任务不存在。")
         self._wake.set()
         return task
+
+    def update_task_options(
+        self, task_id: str, options: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        task = self.get_task(task_id)
+        if task["status"] != "queued" or task["completed_pages"]:
+            raise ValueError("只有尚未开始的排队任务可以修改参数。")
+
+        mode = str(options.get("mode") or "auto").lower()
+        if mode not in MODES:
+            raise ValueError(f"不支持的模式：{mode}")
+        dpi = max(72, min(300, int(options.get("dpi") or 300)))
+        max_pages = max(1, int(options.get("max_pages") or 1000))
+        page_range = str(options.get("page_range") or "")
+        selected_pages = _parse_page_range_spec(
+            page_range, task["total_pages"], max_pages
+        )
+        if not selected_pages:
+            raise ValueError("页码范围没有有效页面。")
+        normalized = {
+            "mode": mode,
+            "dpi": dpi,
+            "max_pages": max_pages,
+            "page_range": page_range,
+            "force_ocr": bool(options.get("force_ocr", False)),
+            "use_llm": bool(options.get("use_llm", False)),
+            "strip_existing_ocr": bool(
+                options.get("strip_existing_ocr", False)
+            ),
+            "keep_headers_footers": bool(
+                options.get("keep_headers_footers", False)
+            ),
+        }
+        updated = self.store.update_queued_task(
+            task_id, normalized, selected_pages
+        )
+        if updated is None:
+            raise ValueError("任务不存在。")
+        return updated
 
     def cancel_task(self, task_id: str) -> Dict[str, Any]:
         task = self.store.cancel_task(task_id)

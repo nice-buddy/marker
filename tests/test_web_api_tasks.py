@@ -150,6 +150,23 @@ def test_task_api_reorder_cancel_and_delete(tmp_path, monkeypatch):
         assert response.status_code == 200
         tasks.append(response.json())
 
+    patched = client.patch(
+        f"/api/tasks/{tasks[0]['id']}",
+        json={
+            "mode": "fast",
+            "dpi": 200,
+            "max_pages": 10,
+            "page_range": "",
+            "force_ocr": True,
+            "use_llm": False,
+            "strip_existing_ocr": False,
+            "keep_headers_footers": True,
+        },
+    )
+    assert patched.status_code == 200
+    assert patched.json()["options"]["mode"] == "fast"
+    assert patched.json()["options"]["dpi"] == 200
+
     reordered = client.post(
         "/api/tasks/reorder",
         json={"task_ids": [tasks[2]["id"], tasks[0]["id"], tasks[1]["id"]]},
